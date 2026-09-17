@@ -30,7 +30,7 @@ const {
   normalizeChannelId,
   isDeliveryEligible,
 } = require('./services/channels');
-const { allocateCaption, replyCaptionInChannel, parseCaptionNumber } = require('./services/captions');
+const { allocateCaption, replyCaptionInChannel, parseCaptionNumber, handleCaptionCollision } = require('./services/captions');
 const { deliverVideoForQuery, findVideoByCaption, BOT_KEY } = require('./services/delivery');
 const UserbotAccount = require('./models/UserbotAccount');
 const {
@@ -405,7 +405,28 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
     // Always write DB row so admins see content pending approval
     const rawCaption = msg.caption || null;
     const manualN = parseCaptionNumber(rawCaption);
-    const caption = await allocateCaption(rawCaption).catch(async (err) => {
+
+    // Detect manual-caption collision explicitly BEFORE allocateCaption so we can fire the edit/reply chain.
+    let manualCollision = false;
+    if (manualN != null) {
+      try {
+        const colliding = await Video.findOne({ caption_number: manualN }).select('_id source').lean().catch(() => null);
+        // If there's already another video with that number, it's a collision.
+        if (colliding) {
+          // If the existing row is the same (channel_id + message_id) because of a prior ingest-save, no collision.
+          const sameSource =
+            colliding.source &&
+            String(colliding.source.channel_id) === String(chatId) &&
+            Number(colliding.source.message_id) === Number(messageId);
+          if (!sameSource) manualCollision = true;
+        }
+      } catch (err) {
+        console.error('[ingest] collision probe error:', err.message);
+      }
+    }
+
+    // Allocate: if collision detected, force auto-assign by passing null manualText so we get a fresh unique number.
+    const caption = await allocateCaption(manualCollision ? null : rawCaption).catch(async (err) => {
       console.error('[ingest] caption allocate error:', err.message);
       const v = await Video.find().sort({ caption_number: -1 }).limit(1).select('caption_number').lean().catch(() => null);
       return v && v[0] ? Number(v[0].caption_number) + 1 : 1;
@@ -424,10 +445,40 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
     if (existing) {
       // update caption only if manual caption was edited or not set yet
       const patch = {};
-      if (rawCaption != null && manualN != null && Number(existing.caption_number) !== Number(manualN)) {
+      let ranCollisionChain = false;
+
+      if (manualN != null && Number(existing.caption_number) !== Number(manualN)) {
         const collision = await Video.findOne({ caption_number: manualN, _id: { $ne: existing._id } }).select('_id').lean().catch(() => null);
-        if (!collision) patch.caption_number = manualN;
+        if (!collision) {
+          patch.caption_number = manualN;
+        } else {
+          // Manual edit -> colliding number on TG side. Reassign in DB and run edit/reply chain.
+          patch.caption_number = Number(caption);
+          if (approved && chatId && messageId) {
+            try {
+              await handleCaptionCollision(ctx.telegram, chatId, Number(messageId), manualN, Number(caption));
+              ranCollisionChain = true;
+            } catch (err) {
+              console.error('[ingest] existing-row collision chain error:', err.message);
+            }
+          }
+        }
+      } else if (manualCollision && !ranCollisionChain) {
+        // Manual caption was set AND collided (same number as current DB row would be no-op above).
+        // If existing.caption_number already differs from manualN because we just reassigned, patch it.
+        if (Number(existing.caption_number) !== Number(caption)) {
+          patch.caption_number = Number(caption);
+        }
+        if (approved && chatId && messageId) {
+          try {
+            await handleCaptionCollision(ctx.telegram, chatId, Number(messageId), manualN, Number(caption));
+            ranCollisionChain = true;
+          } catch (err) {
+            console.error('[ingest] existing-row collision chain (b) error:', err.message);
+          }
+        }
       }
+
       if (!existing.file_unique_id && video?.file_unique_id) patch.file_unique_id = video.file_unique_id;
       patch.last_seen_at = new Date();
       if (Object.keys(patch).length) {
@@ -467,8 +518,15 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
       return next();
     }
 
-    // If the admin didn't put a numeric caption, reply with the generated one in the channel.
-    if (manualN == null && approved) {
+    // Manual caption colliding with an existing number -> run the edit/reply chain.
+    if (manualCollision && approved && chatId && messageId) {
+      try {
+        await handleCaptionCollision(ctx.telegram, chatId, Number(messageId), manualN, Number(caption));
+      } catch (err) {
+        console.error('[ingest] new-row collision chain error:', err.message);
+      }
+    } else if (manualN == null && approved) {
+      // If the admin didn't put a numeric caption, reply with the generated one in the channel.
       await replyCaptionInChannel(ctx.telegram, chatId, Number(messageId), caption);
     }
     return next();

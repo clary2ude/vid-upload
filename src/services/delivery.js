@@ -56,7 +56,7 @@ async function hasActiveUserbot() {
   }
 }
 
-async function hotSendVideo(bot, chatId, row) {
+async function hotSendVideo(telegram, chatId, row) {
   try {
     const botKey = BOT_KEY;
     const fid = row && row.bot_file_ids ? row.bot_file_ids[botKey] : null;
@@ -64,7 +64,7 @@ async function hotSendVideo(bot, chatId, row) {
 
     return await rateLimited(async () => {
       try {
-        const msg = await bot.telegram.sendVideo(chatId, fid, { supports_streaming: true });
+        const msg = await telegram.sendVideo(chatId, fid, { supports_streaming: true });
         return { ok: true, via: 'hot_sendVideo', message: msg };
       } catch (err) {
         return { ok: false, reason: 'sendVideo_failed', error: err };
@@ -75,7 +75,7 @@ async function hotSendVideo(bot, chatId, row) {
   }
 }
 
-async function coldForwardAndSeed(bot, chatId, row) {
+async function coldForwardAndSeed(telegram, chatId, row) {
   try {
     if (!row || !row.source || !row.source.channel_id || !row.source.message_id) {
       return { ok: false, reason: 'missing_source' };
@@ -86,13 +86,13 @@ async function coldForwardAndSeed(bot, chatId, row) {
 
     const msg = await rateLimited(async () => {
       try {
-        return await bot.telegram.copyMessage(chatId, row.source.channel_id, row.source.message_id, {
+        return await telegram.copyMessage(chatId, row.source.channel_id, row.source.message_id, {
           disable_notification: true,
         });
       } catch (forwardErr) {
         // fall back to forwardMessage if copy fails
         try {
-          return await bot.telegram.forwardMessage(chatId, row.source.channel_id, row.source.message_id, {
+          return await telegram.forwardMessage(chatId, row.source.channel_id, row.source.message_id, {
             disable_notification: true,
           });
         } catch (err) {
