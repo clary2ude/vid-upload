@@ -405,6 +405,7 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
     // Always write DB row so admins see content pending approval
     const rawCaption = msg.caption || null;
     const manualN = parseCaptionNumber(rawCaption);
+    const mediaKind = video ? 'video' : (msg.photo ? 'photo' : 'text');
 
     // Detect manual-caption collision explicitly BEFORE allocateCaption so we can fire the edit/reply chain.
     let manualCollision = false;
@@ -456,7 +457,7 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
           patch.caption_number = Number(caption);
           if (approved && chatId && messageId) {
             try {
-              await handleCaptionCollision(ctx.telegram, chatId, Number(messageId), manualN, Number(caption));
+              await handleCaptionCollision(ctx.telegram, chatId, Number(messageId), manualN, Number(caption), mediaKind);
               ranCollisionChain = true;
             } catch (err) {
               console.error('[ingest] existing-row collision chain error:', err.message);
@@ -471,7 +472,7 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
         }
         if (approved && chatId && messageId) {
           try {
-            await handleCaptionCollision(ctx.telegram, chatId, Number(messageId), manualN, Number(caption));
+            await handleCaptionCollision(ctx.telegram, chatId, Number(messageId), manualN, Number(caption), mediaKind);
             ranCollisionChain = true;
           } catch (err) {
             console.error('[ingest] existing-row collision chain (b) error:', err.message);
@@ -492,7 +493,7 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
       caption_number: caption,
       source: { channel_id: chatId, message_id: Number(messageId) },
       metadata: {
-        kind: video ? 'video' : 'photo',
+        kind: mediaKind,
         mime_type: video?.mime_type || '',
         file_name: video?.file_name || '',
         file_size: Number(video?.file_size || 0),
@@ -521,7 +522,7 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
     // Manual caption colliding with an existing number -> run the edit/reply chain.
     if (manualCollision && approved && chatId && messageId) {
       try {
-        await handleCaptionCollision(ctx.telegram, chatId, Number(messageId), manualN, Number(caption));
+        await handleCaptionCollision(ctx.telegram, chatId, Number(messageId), manualN, Number(caption), mediaKind);
       } catch (err) {
         console.error('[ingest] new-row collision chain error:', err.message);
       }

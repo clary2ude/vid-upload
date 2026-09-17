@@ -102,7 +102,11 @@ async function tryBotEditCaption(telegram, channelChatId, messageId, newCaption)
   try {
     return await rateLimited(async () => {
       try {
-        const res = await telegram.editMessageCaption(channelChatId, messageId, {
+        // Telegraf Telegram instance: editMessageCaption([chatId], [messageId], [inlineMessageId], [extra])
+        // Pass caption via extra.caption + explicit chat_id + message_id for robustness.
+        const res = await telegram.editMessageCaption(null, null, null, {
+          chat_id: channelChatId,
+          message_id: Number(messageId),
           caption: String(newCaption),
         });
         return !!res;
@@ -117,7 +121,7 @@ async function tryBotEditCaption(telegram, channelChatId, messageId, newCaption)
   }
 }
 
-async function tryUserbotEditCaption(channelChatId, messageId, newCaption) {
+async function tryUserbotEditCaption(channelChatId, messageId, newCaption, mediaKindHint) {
   let client = null;
   try {
     const account = await UserbotAccount.findOne({ session: { $ne: null, $exists: true } })
@@ -133,17 +137,77 @@ async function tryUserbotEditCaption(channelChatId, messageId, newCaption) {
       { useWSS: false, autoReconnect: true, timeout: 30000, requestRetries: 3, connectionRetries: 3 }
     );
     await client.connect();
+
+    // Resolve peer via the client so access_hash is fetched.
     let peer;
-    const raw = String(channelChatId).replace(/^-100/, '');
-    if (/^\d+$/.test(raw)) peer = new Api.InputPeerChannel({ channelId: Number(raw), accessHash: 0n });
-    else peer = String(channelChatId);
-    await client.invoke(
-      new Api.messages.EditMessage({
-        peer,
-        id: Number(messageId),
-        message: String(newCaption),
+    try {
+      peer = await client.getInputPeer(channelChatId);
+    } catch (peerErr) {
+      // Try stripping -100 and using raw channel id via a simple chat lookup.
+      const raw = String(channelChatId).replace(/^-100/, '');
+      if (/^\d+$/.test(raw)) {
+        try {
+          peer = await client.getInputPeer(`-100${raw}`);
+        } catch {}
+      }
+    }
+    if (!peer) return false;
+
+    // Fetch the original message so we can attach the InputMedia to keep media intact while changing caption.
+    const messages = await client.invoke(
+      new Api.channels.GetMessages({
+        channel: peer,
+        id: [new Api.InputMessageID({ id: Number(messageId) })],
       })
     );
+    const list = Array.isArray(messages?.messages) ? messages.messages : [];
+    const msg = list[0];
+    if (!msg) return false;
+    const media = msg.media || null;
+    let newMedia = null;
+
+    if (media) {
+      if (media instanceof Api.MessageMediaDocument) {
+        const doc = media.document;
+        if (doc instanceof Api.Document) {
+          newMedia = new Api.InputMediaDocument({
+            id: new Api.InputDocument({
+              id: doc.id,
+              accessHash: doc.accessHash,
+              fileReference: doc.fileReference,
+            }),
+            caption: String(newCaption),
+          });
+        }
+      } else if (media instanceof Api.MessageMediaPhoto) {
+        const pho = media.photo;
+        if (pho instanceof Api.Photo) {
+          newMedia = new Api.InputMediaPhoto({
+            id: new Api.InputPhoto({
+              id: pho.id,
+              accessHash: pho.accessHash,
+              fileReference: pho.fileReference,
+            }),
+            caption: String(newCaption),
+          });
+        }
+      }
+    }
+
+    // If we couldn't reconstruct an InputMedia with caption, fall back to messages.EditMessage
+    // with message set to the new caption. Note: this only works for text messages, not media captions.
+    const invokePayload = {
+      peer,
+      id: Number(messageId),
+      noWebpage: true,
+    };
+    if (newMedia) {
+      invokePayload.media = newMedia;
+    } else {
+      invokePayload.message = String(newCaption);
+    }
+
+    await client.invoke(new Api.messages.EditMessage(invokePayload));
     return true;
   } catch (err) {
     console.error('[captions] userbot edit caption error:', err.message);
@@ -176,10 +240,10 @@ async function replyCollisionNotice(telegram, channelChatId, replyToMessageId, n
   }
 }
 
-async function handleCaptionCollision(telegram, channelChatId, messageId, oldCaption, newCaption) {
+async function handleCaptionCollision(telegram, channelChatId, messageId, oldCaption, newCaption, mediaKindHint) {
   const edited = await tryBotEditCaption(telegram, channelChatId, messageId, newCaption);
   if (edited) return { edited: true, via: 'bot' };
-  const ubEdited = await tryUserbotEditCaption(channelChatId, messageId, newCaption);
+  const ubEdited = await tryUserbotEditCaption(channelChatId, messageId, newCaption, mediaKindHint);
   if (ubEdited) return { edited: true, via: 'userbot' };
   await replyCollisionNotice(telegram, channelChatId, messageId, newCaption);
   return { edited: false, via: 'reply_fallback' };
