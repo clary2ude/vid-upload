@@ -5,11 +5,19 @@ const { Markup } = require('telegraf');
 function mainMenuKeyboard(isAdmin) {
   const rows = [
     [Markup.button.callback('⬆️ Uploader', 'menu_uploader')],
+    [Markup.button.callback('🧹 Clear Storage', 'menu_clear_storage')],
   ];
   if (isAdmin) {
     rows.push([Markup.button.callback('⚙️ Admin Panel', 'menu_admin')]);
   }
   return Markup.inlineKeyboard(rows);
+}
+
+function clearStorageConfirmKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('✅ Yes', 'clear_storage_yes')],
+    [Markup.button.callback('✖ No', 'clear_storage_no')],
+  ]);
 }
 
 function backMainKeyboard() {
@@ -100,6 +108,7 @@ function uploaderIntroKeyboard(hasAnySession) {
 
 module.exports = {
   mainMenuKeyboard,
+  clearStorageConfirmKeyboard,
   backMainKeyboard,
   adminMainKeyboard,
   adminsInlineKeyboard,

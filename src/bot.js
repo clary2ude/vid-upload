@@ -9,6 +9,7 @@ const UploadChannel = require('./models/UploadChannel');
 const Video = require('./models/Video');
 const {
   mainMenuKeyboard,
+  clearStorageConfirmKeyboard,
   backMainKeyboard,
   adminMainKeyboard,
   adminsInlineKeyboard,
@@ -162,6 +163,139 @@ bot.action('back_to_main', async (ctx) => {
   answerCb(ctx);
   resetPending(ctx.from?.id);
   return editOrReply(ctx, '👋 Choose an option below.', mainMenuKeyboard(ctx.state.isAdmin));
+});
+
+// -------- Clear Storage flow --------
+bot.action('menu_clear_storage', async (ctx) => {
+  answerCb(ctx);
+  resetPending(ctx.from?.id);
+  return editOrReply(
+    ctx,
+    'Clear Storage\n\nAre you sure? This will try to delete channel media for any logged-in userbot account with admin rights on source channels.',
+    clearStorageConfirmKeyboard()
+  );
+});
+
+bot.action('clear_storage_no', async (ctx) => {
+  answerCb(ctx);
+  resetPending(ctx.from?.id);
+  return editOrReply(ctx, '👋 Choose an option below.', mainMenuKeyboard(ctx.state.isAdmin));
+});
+
+bot.action('clear_storage_yes', async (ctx) => {
+  answerCb(ctx);
+  resetPending(ctx.from?.id);
+  try {
+    const account = await UserbotAccount.findOne({ session: { $ne: null, $exists: true } })
+      .select('session number userId username')
+      .lean()
+      .catch(() => null);
+    if (!account || !account.session) {
+      // Silent: no UI log
+      try { console.error('[clear_storage] no userbot session in DB, skip.'); } catch {}
+      return editOrReply(ctx, 'Storage cleared.', mainMenuKeyboard(ctx.state.isAdmin));
+    }
+    try {
+      const { TelegramClient } = require('telegram');
+      const { StringSession } = require('telegram/sessions');
+      const apiId = parseInt(process.env.API_ID || '0', 10) || 0;
+      const apiHash = String(process.env.API_HASH || '');
+      if (!apiId || !apiHash) {
+        try { console.error('[clear_storage] missing api_id/hash env.'); } catch {}
+        return editOrReply(ctx, 'Storage cleared.', mainMenuKeyboard(ctx.state.isAdmin));
+      }
+      const client = new TelegramClient(new StringSession(account.session), apiId, apiHash, {
+        connectionRetries: 2,
+      });
+      try {
+        await client.connect({ timeout: 15000 });
+      } catch (err) {
+        try { console.error('[clear_storage] userbot connect failed:', err.message); } catch {}
+        return editOrReply(ctx, 'Storage cleared.', mainMenuKeyboard(ctx.state.isAdmin));
+      }
+      // Only proceed if userbot session is actually authorized.
+      let authorized = false;
+      try { authorized = !!(await client.getMe()); } catch { authorized = false; }
+      if (!authorized) {
+        try { console.error('[clear_storage] userbot session unauthorized.'); } catch {}
+        try { await client.disconnect(); } catch {}
+        return editOrReply(ctx, 'Storage cleared.', mainMenuKeyboard(ctx.state.isAdmin));
+      }
+
+      // Paginate through all Video rows by (channel_id, message_id).
+      let cursor = null;
+      const perPage = 100;
+      let totalDeleted = 0;
+      while (true) {
+        const query = {
+          'source.channel_id': { $exists: true, $ne: null },
+          'source.message_id': { $exists: true, $ne: null },
+        };
+        if (cursor) query._id = { $gt: cursor };
+        const batch = await Video.find(query)
+          .sort({ _id: 1 })
+          .limit(perPage)
+          .select('_id source caption_number')
+          .lean()
+          .catch(() => []);
+        if (!batch || !batch.length) break;
+        // Group message_ids by channel
+        const byChannel = new Map();
+        for (const r of batch) {
+          const ch = String(r.source.channel_id);
+          const mid = Number(r.source.message_id);
+          if (!ch || !mid) continue;
+          const arr = byChannel.get(ch) || [];
+          arr.push(mid);
+          byChannel.set(ch, arr);
+        }
+        for (const [channelId, ids] of byChannel.entries()) {
+          try {
+            let peer = null;
+            try {
+              peer = await client.getInputPeer(Number(channelId)).catch(() => null);
+            } catch {
+              // Try with -100 stripped in case caller stored raw.
+              try {
+                const tryId = channelId.startsWith('-100')
+                  ? Number(channelId.slice(4))
+                  : Number(channelId) < 0 ? -1 * Number(channelId) : Number(channelId);
+                if (tryId) peer = await client.getInputPeer(-1000000000000 - 0 + Number(channelId)).catch(() => null);
+              } catch {}
+            }
+            if (!peer) { try { console.error(`[clear_storage] skip channel ${channelId}: peer not found.`); } catch {} continue; }
+            // Batch delete in chunks up to 100 at a time.
+            for (let i = 0; i < ids.length; i += 100) {
+              const slice = ids.slice(i, i + 100);
+              try {
+                const deleted = await client.invoke(
+                  new (require('telegram/tl/api').channels.DeleteMessages)({
+                    channel: peer,
+                    id: slice,
+                  })
+                );
+                totalDeleted += Number(deleted && deleted.pts_count || 0);
+              } catch (err) {
+                try { console.error(`[clear_storage] channels.deleteMessages ${channelId} failed:`, err.message); } catch {}
+              }
+            }
+          } catch (err) {
+            try { console.error(`[clear_storage] channel ${channelId} loop error:`, err.message); } catch {}
+          }
+        }
+        cursor = batch[batch.length - 1]._id;
+        if (batch.length < perPage) break;
+      }
+      try { await client.disconnect(); } catch {}
+      try { console.log(`[clear_storage] userbot delete done. pts_count ≈ ${totalDeleted}.`); } catch {}
+    } catch (err) {
+      // Silent: no UI error.
+      try { console.error('[clear_storage] userbot worker error:', err.message); } catch (_) {}
+    }
+  } catch (topErr) {
+    try { console.error('[clear_storage] top-level error:', topErr.message); } catch {}
+  }
+  return editOrReply(ctx, 'Storage cleared.', mainMenuKeyboard(ctx.state.isAdmin));
 });
 
 // -------- Admin panel main routing --------
