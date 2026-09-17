@@ -405,16 +405,13 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
     // Always write DB row so admins see content pending approval
     const rawCaption = msg.caption || null;
     const manualN = parseCaptionNumber(rawCaption);
-    const mediaKind = video ? 'video' : (msg.photo ? 'photo' : 'text');
 
-    // Detect manual-caption collision explicitly BEFORE allocateCaption so we can fire the edit/reply chain.
+    // Detect manual-caption collision explicitly BEFORE allocateCaption so we can fire the reply chain.
     let manualCollision = false;
     if (manualN != null) {
       try {
         const colliding = await Video.findOne({ caption_number: manualN }).select('_id source').lean().catch(() => null);
-        // If there's already another video with that number, it's a collision.
         if (colliding) {
-          // If the existing row is the same (channel_id + message_id) because of a prior ingest-save, no collision.
           const sameSource =
             colliding.source &&
             String(colliding.source.channel_id) === String(chatId) &&
@@ -433,7 +430,7 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
       return v && v[0] ? Number(v[0].caption_number) + 1 : 1;
     });
 
-    // Check if row already exists by (channel, message_id) or mtproto id
+    // Check if row already exists by (channel, message_id) or file_unique_id
     const existing = await Video.findOne({
       $or: [
         { 'source.channel_id': chatId, 'source.message_id': Number(messageId) },
@@ -444,7 +441,6 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
       .catch(() => null);
 
     if (existing) {
-      // update caption only if manual caption was edited or not set yet
       const patch = {};
       let ranCollisionChain = false;
 
@@ -453,11 +449,10 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
         if (!collision) {
           patch.caption_number = manualN;
         } else {
-          // Manual edit -> colliding number on TG side. Reassign in DB and run edit/reply chain.
           patch.caption_number = Number(caption);
           if (approved && chatId && messageId) {
             try {
-              await handleCaptionCollision(ctx.telegram, chatId, Number(messageId), manualN, Number(caption), mediaKind);
+              await handleCaptionCollision(ctx.telegram, chatId, Number(messageId), manualN, Number(caption));
               ranCollisionChain = true;
             } catch (err) {
               console.error('[ingest] existing-row collision chain error:', err.message);
@@ -465,14 +460,12 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
           }
         }
       } else if (manualCollision && !ranCollisionChain) {
-        // Manual caption was set AND collided (same number as current DB row would be no-op above).
-        // If existing.caption_number already differs from manualN because we just reassigned, patch it.
         if (Number(existing.caption_number) !== Number(caption)) {
           patch.caption_number = Number(caption);
         }
         if (approved && chatId && messageId) {
           try {
-            await handleCaptionCollision(ctx.telegram, chatId, Number(messageId), manualN, Number(caption), mediaKind);
+            await handleCaptionCollision(ctx.telegram, chatId, Number(messageId), manualN, Number(caption));
             ranCollisionChain = true;
           } catch (err) {
             console.error('[ingest] existing-row collision chain (b) error:', err.message);
@@ -493,7 +486,7 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
       caption_number: caption,
       source: { channel_id: chatId, message_id: Number(messageId) },
       metadata: {
-        kind: mediaKind,
+        kind: video ? 'video' : 'photo',
         mime_type: video?.mime_type || '',
         file_name: video?.file_name || '',
         file_size: Number(video?.file_size || 0),
@@ -508,7 +501,6 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
     try {
       await Video.create(row);
     } catch (err) {
-      // uniqueness collision; try re-fetch and update caption field only on duplicate key for (channel,msg_id)
       if (err && err.code === 11000) {
         try {
           const prior = await Video.findOne({ 'source.channel_id': chatId, 'source.message_id': Number(messageId) }).lean();
@@ -519,10 +511,9 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
       return next();
     }
 
-    // Manual caption colliding with an existing number -> run the edit/reply chain.
     if (manualCollision && approved && chatId && messageId) {
       try {
-        await handleCaptionCollision(ctx.telegram, chatId, Number(messageId), manualN, Number(caption), mediaKind);
+        await handleCaptionCollision(ctx.telegram, chatId, Number(messageId), manualN, Number(caption));
       } catch (err) {
         console.error('[ingest] new-row collision chain error:', err.message);
       }
@@ -552,17 +543,23 @@ bot.on('text', async (ctx, next) => {
       try {
         const uid = ctx.from?.id;
         const chatId = ctx.chat?.id;
+        const chatType = ctx.chat?.type;
+        const isPrivate = chatType === 'private';
         if (chatId) {
           const res = await deliverVideoForQuery(ctx.telegram, chatId, txt);
-          // Silence explicitly on: no_approved_channels_silent, video_channel_unapproved_silent, bad_input, not_found
+          // Silence explicitly on: no_approved_channels_silent, video_channel_unapproved_silent, bad_input
+          // not_found -> reply in private chats with "No video with that number❌"
           const SILENT = new Set([
             'no_approved_channels_silent',
             'video_channel_unapproved_silent',
             'bad_input',
-            'not_found',
           ]);
           if (res.delivered) return;
           if (res.reason && SILENT.has(res.reason)) return;
+          if (isPrivate && res.reason === 'not_found') {
+            try { await ctx.reply('No video with that number❌'); } catch (err) { console.error('[text not_found reply error]:', err.message); }
+            return;
+          }
         }
       } catch (err) {
         console.error('[text media query] error:', err.message);
