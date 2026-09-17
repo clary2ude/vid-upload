@@ -394,7 +394,10 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
     if (msg.chat && (msg.chat.type === 'channel' || msg.chat.type === 'supergroup')) {
       await upsertChannelFromChat(msg.chat, ctx.from?.id || null);
     }
-    const video = msg.video || null;
+    const video =
+      msg.video ||
+      (msg.document && /^video\//i.test(msg.document.mime_type || '') ? msg.document : null) ||
+      null;
     if (!video && !msg.photo) return next();
 
     const chatId = msg.chat && msg.chat.id != null ? String(msg.chat.id) : null;
