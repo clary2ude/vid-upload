@@ -32,6 +32,13 @@ const {
 } = require('./services/channels');
 const { allocateCaption, replyCaptionInChannel, parseCaptionNumber } = require('./services/captions');
 const { deliverVideoForQuery, findVideoByCaption, BOT_KEY } = require('./services/delivery');
+const UserbotAccount = require('./models/UserbotAccount');
+const {
+  beginLogin,
+  handleCancel,
+  handleTextMessage: uploaderHandleText,
+  listLoggedInAccounts,
+} = require('./bot/uploaderLogin');
 
 const bot = new Telegraf(process.env.BOT_TOKEN, {
   telegram: { webhookReply: false },
@@ -64,29 +71,17 @@ function getPending(userId) {
   return PENDING[Number(userId)] || null;
 }
 
-function escapeMd(s) {
-  if (s == null) return '';
-  return String(s).replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
-}
-
 async function editOrReply(ctx, text, extra = {}) {
-  const safeExtra = { ...extra };
-  if (
-    safeExtra.parse_mode &&
-    String(safeExtra.parse_mode || '').toLowerCase() === 'markdownv2'
-  ) {
-    safeExtra.parse_mode = 'Markdown';
-  }
   try {
     if (ctx.callbackQuery) {
-      await ctx.editMessageText(text, { disable_web_page_preview: true, ...safeExtra });
+      await ctx.editMessageText(text, { disable_web_page_preview: true, ...extra });
       return;
     }
   } catch (err) {
     console.error('[editOrReply edit error:', err?.message || err);
   }
   try {
-    await ctx.reply(text, { disable_web_page_preview: true, ...safeExtra });
+    await ctx.reply(text, { disable_web_page_preview: true, ...extra });
   } catch (err) {
     console.error('[editOrReply reply error:', err?.message || err);
     try { await ctx.reply(text).catch(() => {}); } catch {}
@@ -105,10 +100,10 @@ bot.start(async (ctx) => {
   try {
     const isAdmin = ctx.state.isAdmin;
     if (isAdmin) {
-      await ctx.reply('👋 Welcome back, Admin.\n\nChoose an option below.', mainMenuKeyboard(true));
+      await ctx.reply('Welcome to PboxTv\n\nChoose an option below.', mainMenuKeyboard(true));
       return;
     }
-    await ctx.reply('👋 Welcome! Type the video number (e.g. 42) and I\'ll send it to you instantly.\n\nOr tap Uploader if you\'re an admin uploading content to the channel.');
+    await ctx.reply('Welcome to PboxTv\n\nType the video number (e.g. 42) and I\'ll send it to you instantly.');
   } catch (err) {
     console.error('[start] error:', err?.message || err);
   }
@@ -117,7 +112,7 @@ bot.start(async (ctx) => {
 bot.action('back_main', async (ctx) => {
   answerCb(ctx);
   resetPending(ctx.from?.id);
-  return editOrReply(ctx, '👋 Choose an option below.', mainMenuKeyboard(ctx.state.isAdmin));
+  return editOrReply(ctx, 'Choose an option below.', mainMenuKeyboard(ctx.state.isAdmin));
 });
 
 bot.action('menu_uploader', async (ctx) => {
@@ -126,29 +121,47 @@ bot.action('menu_uploader', async (ctx) => {
   if (!isAdmin) {
     return editOrReply(
       ctx,
-      '👋 Type the video number you\'re looking for (e.g. 123).\n\nAdmin? Request access from the superadmin first.',
+      'Type the video number you\'re looking for (e.g. 123).',
       backMainKeyboard()
     );
   }
+  let hasAnySession = false;
+  try {
+    hasAnySession = (await UserbotAccount.countDocuments({ session: { $ne: null, $exists: true } }).lean().catch(() => 0)) > 0;
+  } catch {}
   const lines = [
-    '⬆️ *Uploader Guide*',
+    '⬆️ Uploader',
     '',
-    '1\\. Post a video to any approved channel.',
-    '2\\. If you write a numeric caption (1\\-5 digits, no letters), it becomes the video number.',
-    '3\\. If no caption is present, I auto\\-assign the next incrementing number and reply to the post in the channel with it.',
+    'Post videos to approved channels, or add a GramJS userbot session below to enable Plan 4/5 fallback delivery.',
     '',
-    '✅ After that, any user can send that number to the bot and receive the video instantly.',
+    '1. Post a video to any approved channel.',
+    '2. If you write a numeric caption (1-5 digits, no letters), it becomes the video number.',
+    '3. If no caption is present, I auto-assign the next incrementing number and reply to the post in the channel with it.',
+    '',
+    'After that, any user can send that number to the bot and receive the video instantly.',
   ];
-  return editOrReply(ctx, lines.join('\n'), { parse_mode: 'MarkdownV2', ...uploaderIntroKeyboard() });
+  return editOrReply(ctx, lines.join('\n'), uploaderIntroKeyboard(hasAnySession));
 });
 
-bot.action('uploader_howto', async (ctx) => {
+bot.action('uploader_add_account', async (ctx) => {
   answerCb(ctx);
-  return editOrReply(
-    ctx,
-    '📝 *Quick Uploader Steps*\n\n1\\. Go to the channel\\.\n2\\. Send a video\\.\n3\\. Optional: set a 1\\-5 digit numeric caption to lock that number\\.\n4\\. Done\\. If no caption, the bot replies to the post with the auto\\-generated number immediately\\.',
-    { parse_mode: 'MarkdownV2', ...backMainKeyboard() }
-  );
+  if (!ctx.state.isAdmin) return;
+  return beginLogin(ctx);
+});
+
+bot.action('uploader_list_accounts', async (ctx) => {
+  answerCb(ctx);
+  if (!ctx.state.isAdmin) return;
+  const chatId = ctx.chat?.id || ctx.from?.id;
+  if (!chatId) return;
+  return listLoggedInAccounts(bot, chatId);
+});
+
+bot.action('back_to_main', async (ctx) => {
+  await handleCancel(ctx);
+  answerCb(ctx);
+  resetPending(ctx.from?.id);
+  return editOrReply(ctx, '👋 Choose an option below.', mainMenuKeyboard(ctx.state.isAdmin));
 });
 
 // -------- Admin panel main routing --------
@@ -158,8 +171,8 @@ bot.action('menu_admin', async (ctx) => {
   const channels = await UploadChannel.find().lean().catch(() => []);
   return editOrReply(
     ctx,
-    `⚙️ *Admin Panel*\n\n📺 Channels tracked: *${escapeMd(channels.length)}*\n✅ Approved for delivery: *${escapeMd(channels.filter((c) => c.isApproved).length)}*\n👥 Admins: *${escapeMd(adminCache.getAll().length)}*`,
-    { parse_mode: 'MarkdownV2', ...adminMainKeyboard() }
+    `⚙️ Admin Panel\n\n📺 Channels tracked: ${channels.length}\n✅ Approved for delivery: ${channels.filter((c) => c.isApproved).length}\n👥 Admins: ${adminCache.getAll().length}`,
+    adminMainKeyboard()
   );
 });
 
@@ -169,8 +182,8 @@ bot.action('admin_back', async (ctx) => {
   const channels = await UploadChannel.find().lean().catch(() => []);
   return editOrReply(
     ctx,
-    `⚙️ *Admin Panel*\n\n📺 Channels tracked: *${escapeMd(channels.length)}*\n✅ Approved for delivery: *${escapeMd(channels.filter((c) => c.isApproved).length)}*`,
-    { parse_mode: 'MarkdownV2', ...adminMainKeyboard() }
+    `⚙️ Admin Panel\n\n📺 Channels tracked: ${channels.length}\n✅ Approved for delivery: ${channels.filter((c) => c.isApproved).length}`,
+    adminMainKeyboard()
   );
 });
 
@@ -179,10 +192,7 @@ bot.action('admin_admins', async (ctx) => {
   answerCb(ctx);
   if (!ctx.state.isAdmin) return;
   const admins = await Admin.find().sort({ createdAt: 1 }).lean().catch(() => []);
-  return editOrReply(ctx, '👥 *Admins List*', {
-    parse_mode: 'MarkdownV2',
-    ...adminsInlineKeyboard(admins, ctx.from?.id),
-  });
+  return editOrReply(ctx, '👥 Admins List', adminsInlineKeyboard(admins, ctx.from?.id));
 });
 
 bot.action(/^admin_view:(.+)$/, async (ctx) => {
@@ -190,22 +200,19 @@ bot.action(/^admin_view:(.+)$/, async (ctx) => {
   if (!ctx.state.isAdmin) return;
   const id = ctx.match[1];
   const a = await Admin.findById(id).lean().catch(() => null);
-  if (!a) return editOrReply(ctx, 'Admin not found.', { ...backMainKeyboard() });
+  if (!a) return editOrReply(ctx, 'Admin not found.', backMainKeyboard());
   const isSelf =
     String(a.telegramId) === String(ctx.from?.id) ||
     (a.username && ctx.from?.username && String(a.username).toLowerCase() === `@${String(ctx.from.username)}`.toLowerCase());
   const lines = [
-    '🛡 *Admin Details*',
+    '🛡 Admin Details',
     '',
-    `ID: ${escapeMd(a.telegramId || 'Not set')}`,
-    `Username: ${escapeMd(a.username || 'Not set')}`,
+    `ID: ${a.telegramId || 'Not set'}`,
+    `Username: ${a.username || 'Not set'}`,
     `Super Admin: ${a.isSuperAdmin ? '✅ Yes' : '❌ No'}`,
-    `Added: ${escapeMd(a.createdAt ? a.createdAt.toDateString() : '-')}`,
+    `Added: ${a.createdAt ? a.createdAt.toDateString() : '-'}`,
   ];
-  return editOrReply(ctx, lines.join('\n'), {
-    parse_mode: 'MarkdownV2',
-    ...adminActionsKeyboard(id, isSelf, !!ctx.state.isSuperAdmin),
-  });
+  return editOrReply(ctx, lines.join('\n'), adminActionsKeyboard(id, isSelf, !!ctx.state.isSuperAdmin));
 });
 
 bot.action('admin_add', async (ctx) => {
@@ -214,8 +221,8 @@ bot.action('admin_add', async (ctx) => {
   setPending(ctx.from?.id, { type: 'admin_add', step: 1 });
   return editOrReply(
     ctx,
-    '➕ *Add Admin*\n\nStep 1/2: Send @username or numeric Telegram ID.',
-    { parse_mode: 'MarkdownV2', ...cancelInlineKeyboard('admin_cancel') }
+    '➕ Add Admin\n\nStep 1/2: Send @username or numeric Telegram ID.',
+    cancelInlineKeyboard('admin_cancel')
   );
 });
 
@@ -255,10 +262,7 @@ bot.action('admin_cancel', async (ctx) => {
   if (!ctx.state.isAdmin) return;
   resetPending(ctx.from?.id);
   const admins = await Admin.find().sort({ createdAt: 1 }).lean().catch(() => []);
-  return editOrReply(ctx, '👥 *Admins List*', {
-    parse_mode: 'MarkdownV2',
-    ...adminsInlineKeyboard(admins, ctx.from?.id),
-  });
+  return editOrReply(ctx, '👥 Admins List', adminsInlineKeyboard(admins, ctx.from?.id));
 });
 
 // -------- Upload Channel CRUD --------
@@ -274,7 +278,7 @@ bot.on('my_chat_member', async (ctx, next) => {
       try {
         await ctx
           .reply(
-            `📺 Channel tracked automatically:\n\nTitle: ${escapeMd(c.title || '')}\nID: ${escapeMd(c.id)}\nUsername: ${escapeMd(c.username ? '@' + c.username : 'None')}\n\nGo to Admin Panel → Upload Channels to approve it.`
+            `📺 Channel tracked automatically:\n\nTitle: ${c.title || ''}\nID: ${c.id}\nUsername: ${c.username ? '@' + c.username : 'None'}\n\nGo to Admin Panel → Upload Channels to approve it.`
           )
           .catch(() => {});
       } catch {}
@@ -290,10 +294,7 @@ bot.action('admin_channels', async (ctx) => {
   answerCb(ctx);
   if (!ctx.state.isAdmin) return;
   const list = await UploadChannel.find().sort({ createdAt: -1 }).lean().catch(() => []);
-  return editOrReply(ctx, '📺 *Upload Channels*\n\n✅ = approved for media delivery\n❌ = tracked but blocked\n\nApprove to make its videos deliverable to end users.', {
-    parse_mode: 'MarkdownV2',
-    ...channelsInlineKeyboard(list),
-  });
+  return editOrReply(ctx, '📺 Upload Channels\n\n✅ = approved for media delivery\n❌ = tracked but blocked\n\nApprove to make its videos deliverable to end users.', channelsInlineKeyboard(list));
 });
 
 bot.action(/^channel_view:(.+)$/, async (ctx) => {
@@ -301,20 +302,17 @@ bot.action(/^channel_view:(.+)$/, async (ctx) => {
   if (!ctx.state.isAdmin) return;
   const id = ctx.match[1];
   const c = await UploadChannel.findById(id).lean().catch(() => null);
-  if (!c) return editOrReply(ctx, 'Channel not found.', { ...backMainKeyboard() });
+  if (!c) return editOrReply(ctx, 'Channel not found.', backMainKeyboard());
   const lines = [
-    '📺 *Channel Details*',
+    '📺 Channel Details',
     '',
-    `Title: ${escapeMd(c.title || 'Not set')}`,
-    `ID: ${escapeMd(c.channelId)}`,
-    `Username: ${escapeMd(c.username || 'None')}`,
+    `Title: ${c.title || 'Not set'}`,
+    `ID: ${c.channelId}`,
+    `Username: ${c.username || 'None'}`,
     `Approved: ${c.isApproved ? '✅ Yes' : '❌ No (deselected)'}`,
-    `Added: ${escapeMd(c.createdAt ? c.createdAt.toDateString() : '-')}`,
+    `Added: ${c.createdAt ? c.createdAt.toDateString() : '-'}`,
   ];
-  return editOrReply(ctx, lines.join('\n'), {
-    parse_mode: 'MarkdownV2',
-    ...channelActionsKeyboard(id),
-  });
+  return editOrReply(ctx, lines.join('\n'), channelActionsKeyboard(id));
 });
 
 bot.action('channel_add', async (ctx) => {
@@ -323,8 +321,8 @@ bot.action('channel_add', async (ctx) => {
   setPending(ctx.from?.id, { type: 'channel_add', step: 1 });
   return editOrReply(
     ctx,
-    '➕ *Add Channel*\n\nStep 1/1: Send numeric channel id (e.g. \\-1001234567890) or @username.\n\nTip: just add the bot to the channel and it auto\\-registers too.',
-    { parse_mode: 'MarkdownV2', ...cancelInlineKeyboard('channel_cancel') }
+    '➕ Add Channel\n\nStep 1/1: Send numeric channel id (e.g. -1001234567890) or @username.\n\nTip: just add the bot to the channel and it auto-registers too.',
+    cancelInlineKeyboard('channel_cancel')
   );
 });
 
@@ -385,10 +383,7 @@ bot.action('channel_cancel', async (ctx) => {
   if (!ctx.state.isAdmin) return;
   resetPending(ctx.from?.id);
   const list = await UploadChannel.find().sort({ createdAt: -1 }).lean().catch(() => []);
-  return editOrReply(ctx, '📺 *Upload Channels*', {
-    parse_mode: 'MarkdownV2',
-    ...channelsInlineKeyboard(list),
-  });
+  return editOrReply(ctx, '📺 Upload Channels', channelsInlineKeyboard(list));
 });
 
 // -------- Channel post ingest (Bot API side) + auto-caption reply --------
@@ -488,6 +483,10 @@ bot.on('text', async (ctx, next) => {
   try {
     const txt = (ctx.message && ctx.message.text) ? String(ctx.message.text).trim() : '';
     if (!txt) return next();
+
+    // Uploader GramJS login capture FIRST (phone/code/2FA input before any other flow)
+    const loginHandled = await uploaderHandleText(ctx);
+    if (loginHandled) return;
 
     // Media query by end users first (runs for ALL users, admin or otherwise if it's a number)
     if (/^-?\d+$/.test(txt)) {

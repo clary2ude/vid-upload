@@ -89,11 +89,13 @@ function cancelInlineKeyboard(actionLabel = 'cancel') {
   return Markup.inlineKeyboard([[Markup.button.callback('✖ Cancel', actionLabel)]]);
 }
 
-function uploaderIntroKeyboard() {
-  return Markup.inlineKeyboard([
-    [Markup.button.callback('🔢 How to Upload', 'uploader_howto')],
-    [Markup.button.callback('« Back', 'back_main')],
-  ]);
+function uploaderIntroKeyboard(hasAnySession) {
+  const rows = [
+    [Markup.button.callback('➕ Add Account (Login GramJS)', 'uploader_add_account')],
+  ];
+  if (hasAnySession) rows.push([Markup.button.callback('👁 List Accounts', 'uploader_list_accounts')]);
+  rows.push([Markup.button.callback('<< Back', 'back_main')]);
+  return Markup.inlineKeyboard(rows);
 }
 
 module.exports = {
