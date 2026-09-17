@@ -416,3 +416,47 @@ test('captions: replyCaptionInChannel calls telegram.sendMessage with reply_to_m
   restoreVideo();
   restoreCache();
 });
+
+test('captions: classifyCaption sorts missing/invalid/negative/toolong correctly', () => {
+  freshEnv();
+  const { classifyCaption } = requireFresh('src/services/captions');
+  assert.deepEqual(classifyCaption(null), { kind: 'missing', n: null });
+  assert.deepEqual(classifyCaption('  '), { kind: 'missing', n: null });
+  assert.deepEqual(classifyCaption('abc'), { kind: 'invalid', n: null });
+  assert.deepEqual(classifyCaption('1.5'), { kind: 'invalid', n: null });
+  assert.deepEqual(classifyCaption('-42'), { kind: 'negative_or_zero', n: -42 });
+  assert.deepEqual(classifyCaption('0'), { kind: 'negative_or_zero', n: 0 });
+  assert.deepEqual(classifyCaption('123456'), { kind: 'bad_len', n: 123456 });
+  assert.deepEqual(classifyCaption('12345'), { kind: 'ok', n: 12345 });
+  assert.deepEqual(classifyCaption('7'), { kind: 'ok', n: 7 });
+});
+
+test('captions: allocateCaption auto-generates for bad manual inputs (invalid/negative/toolong)', async () => {
+  freshEnv();
+  const restoreCache = patchModule('src/cache', {});
+  const findOneCalls = [];
+  const restoreVideo = patchModule('src/models/Video', {
+    findOne: (q) => { findOneCalls.push(q); return { select: () => ({ lean: async () => null }) }; },
+  });
+  const counterCalls = [];
+  let counterVal = 9;
+  const restoreCounter = patchModule('src/models/Counter', {
+    findOneAndUpdate: (...args) => { counterCalls.push(args); counterVal += 1; return { lean: async () => ({ value: counterVal }) }; },
+  });
+  const restoreRateLimit = patchModule('src/queue/rateLimit', { rateLimited: async (fn) => await fn(), queryCache: { get: () => undefined, set: () => {} } });
+  const { allocateCaption } = requireFresh('src/services/captions');
+  const a = await allocateCaption('abc');
+  const b = await allocateCaption('-50');
+  const c = await allocateCaption('9999999');
+  assert.equal(Number.isSafeInteger(a), true);
+  assert.equal(Number.isSafeInteger(b), true);
+  assert.equal(Number.isSafeInteger(c), true);
+  for (const n of [a, b, c]) {
+    assert.equal(n > 0, true, `auto ${n} must be >0`);
+    assert.equal(String(n).length <= 5, true, `auto ${n} must be <= 5 digits`);
+  }
+  restoreRateLimit();
+  restoreCounter();
+  restoreVideo();
+  restoreCache();
+});

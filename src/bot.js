@@ -31,7 +31,7 @@ const {
   normalizeChannelId,
   isDeliveryEligible,
 } = require('./services/channels');
-const { allocateCaption, replyCaptionInChannel, parseCaptionNumber, handleCaptionCollision } = require('./services/captions');
+const { allocateCaption, replyCaptionInChannel, parseCaptionNumber, classifyCaption, handleCaptionCollision } = require('./services/captions');
 const { deliverVideoForQuery, findVideoByCaption, BOT_KEY } = require('./services/delivery');
 const UserbotAccount = require('./models/UserbotAccount');
 const {
@@ -550,11 +550,12 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
     const approved = isDeliveryEligible(chatId);
     // Always write DB row so admins see content pending approval
     const rawCaption = msg.caption || null;
-    const manualN = parseCaptionNumber(rawCaption);
+    const manual = classifyCaption(rawCaption);
+    const manualN = manual.n;
 
     // Detect manual-caption collision explicitly BEFORE allocateCaption so we can fire the reply chain.
     let manualCollision = false;
-    if (manualN != null) {
+    if (manual.kind === 'ok' && manualN != null) {
       try {
         const colliding = await Video.findOne({ caption_number: manualN }).select('_id source').lean().catch(() => null);
         if (colliding) {
@@ -569,12 +570,16 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
       }
     }
 
-    // Allocate: if collision detected, force auto-assign by passing null manualText so we get a fresh unique number.
-    const caption = await allocateCaption(manualCollision ? null : rawCaption).catch(async (err) => {
+    // Allocate: pass rawText through only when manual was exactly ok AND no collision.
+    // Otherwise we auto-generate (covers: missing, invalid regex, negative, bad_len, collision).
+    const autoManual = (manual.kind === 'ok' && !manualCollision) ? rawCaption : null;
+    const caption = await allocateCaption(autoManual).catch(async (err) => {
       console.error('[ingest] caption allocate error:', err.message);
       const v = await Video.find().sort({ caption_number: -1 }).limit(1).select('caption_number').lean().catch(() => null);
       return v && v[0] ? Number(v[0].caption_number) + 1 : 1;
     });
+    const manualWasValidWithoutCollision = manual.kind === 'ok' && !manualCollision;
+    const needAutoAssignReply = !manualWasValidWithoutCollision; // true for missing/invalid/negative/bad_len/collision
 
     // Check if row already exists by (channel, message_id) or file_unique_id
     const fileUniqueId = media?.file_unique_id || null;
@@ -589,34 +594,34 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
 
     if (existing) {
       const patch = {};
-      let ranCollisionChain = false;
+      let ranNotice = false;
 
-      if (manualN != null && Number(existing.caption_number) !== Number(manualN)) {
+      if (manual.kind === 'ok' && manualN != null && Number(existing.caption_number) !== Number(manualN)) {
         const collision = await Video.findOne({ caption_number: manualN, _id: { $ne: existing._id } }).select('_id').lean().catch(() => null);
         if (!collision) {
           patch.caption_number = manualN;
         } else {
           patch.caption_number = Number(caption);
-          // Always reply the notice to the admin on collision, regardless of approval status.
+          // Collision -> always reply "Number already exists..." notice, regardless of approval.
           if (chatId && messageId) {
             try {
               await handleCaptionCollision(ctx.telegram, chatId, Number(messageId), manualN, Number(caption));
-              ranCollisionChain = true;
+              ranNotice = true;
             } catch (err) {
               console.error('[ingest] existing-row collision chain error:', err.message);
             }
           }
         }
-      } else if (manualCollision && !ranCollisionChain) {
-        if (Number(existing.caption_number) !== Number(caption)) {
-          patch.caption_number = Number(caption);
-        }
+      } else if (needAutoAssignReply && !ranNotice) {
+        // Manual caption was bad/missing/negative/toolong. Reply the newly auto-assigned number back to the post.
+        const captionChanged = Number(existing.caption_number) !== Number(caption);
+        if (captionChanged) patch.caption_number = Number(caption);
         if (chatId && messageId) {
           try {
-            await handleCaptionCollision(ctx.telegram, chatId, Number(messageId), manualN, Number(caption));
-            ranCollisionChain = true;
+            await replyCaptionInChannel(ctx.telegram, chatId, Number(messageId), Number(caption));
+            ranNotice = true;
           } catch (err) {
-            console.error('[ingest] existing-row collision chain (b) error:', err.message);
+            console.error('[ingest] existing-row bad-caption reply error:', err.message);
           }
         }
       }
@@ -665,9 +670,17 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
       } catch (err) {
         console.error('[ingest] new-row collision chain error:', err.message);
       }
-    } else if (manualN == null && approved) {
-      // If the admin didn't put a numeric caption, reply with the generated one in the channel.
-      await replyCaptionInChannel(ctx.telegram, chatId, Number(messageId), caption);
+    } else if (needAutoAssignReply && chatId && messageId) {
+      // Missing caption OR invalid/negative/bad_len manual caption → reply the auto-assigned number.
+      // Approved gate NOT removed: on unapproved channels this was causing bot-reply-to-message permission
+      // noise; admins can still see the auto-assigned number via DB row.
+      try {
+        if (approved) {
+          await replyCaptionInChannel(ctx.telegram, chatId, Number(messageId), Number(caption));
+        }
+      } catch (err) {
+        console.error('[ingest] bad/missing caption reply error:', err.message);
+      }
     }
     return next();
   } catch (err) {

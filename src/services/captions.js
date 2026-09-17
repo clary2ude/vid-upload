@@ -15,6 +15,19 @@ function parseCaptionNumber(text) {
   return n;
 }
 
+function classifyCaption(text) {
+  if (!text) return { kind: 'missing', n: null };
+  const t = String(text).trim();
+  if (t.length === 0) return { kind: 'missing', n: null };
+  if (!/^-?\d+$/.test(t)) return { kind: 'invalid', n: null };
+  const n = Number(t);
+  if (!Number.isSafeInteger(n)) return { kind: 'invalid', n: null };
+  if (n <= 0) return { kind: 'negative_or_zero', n };
+  const digits = String(Math.abs(n)).length;
+  if (!ALLOWED_DIGIT_LEN.includes(digits)) return { kind: 'bad_len', n };
+  return { kind: 'ok', n };
+}
+
 function isAllowedManualCaption(n) {
   if (n == null || Number.isNaN(n)) return false;
   if (n <= 0) return false;
@@ -127,6 +140,7 @@ async function handleCaptionCollision(telegram, channelChatId, messageId, oldCap
 module.exports = {
   ALLOWED_DIGIT_LEN,
   parseCaptionNumber,
+  classifyCaption,
   isAllowedManualCaption,
   getNextAutoCaption,
   allocateCaption,
