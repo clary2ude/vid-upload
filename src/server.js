@@ -111,16 +111,11 @@ async function boot() {
     try {
       await bot.telegram.setMyCommands([
         { command: 'start', description: 'Start the bot' },
-        { command: 'ping', description: 'Keep-alive ping' },
       ]);
       console.log('[boot] Bot commands registered.');
     } catch (err) {
       console.warn('[boot] setMyCommands failed:', err?.message || err);
     }
-
-    bot.command('ping', (ctx) => {
-      ctx.reply('pong').catch(() => {});
-    });
 
     process.once('SIGINT', () => { try { if (bot) bot.stop('SIGINT'); } catch {} process.exit(0); });
     process.once('SIGTERM', () => { try { if (bot) bot.stop('SIGTERM'); } catch {} process.exit(0); });
