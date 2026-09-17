@@ -100,7 +100,7 @@ async function replyCollisionNotice(telegram, channelChatId, replyToMessageId, n
       try {
         return await telegram.sendMessage(
           channelChatId,
-          `Number already exists❌\nVideo number changed to ${newCaption}✅`,
+          `Number already exists❌\nMedia number changed to ${newCaption}✅`,
           {
             reply_to_message_id: replyToMessageId,
             disable_web_page_preview: true,

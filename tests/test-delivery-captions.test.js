@@ -40,6 +40,7 @@ const UNAPPROVED_CHANNEL = String(-1009998887776);
 const BOT_KEY_FIXTURE = '123456789';
 const VIDEO_FILE_ID = 'FILEID_ABC';
 const USER_CHAT = 9000000001;
+const USER_MSG_ID = 4242;
 
 function freshEnv() {
   process.env.BOT_TOKEN = `${BOT_KEY_FIXTURE}:AAFAKEFAKEFAKE`;
@@ -51,9 +52,11 @@ function freshEnv() {
 }
 
 function fakeTelegramSpies() {
-  const calls = { sendVideo: [], copyMessage: [], forwardMessage: [], sendMessage: [], editMessageCaption: [] };
+  const calls = { sendVideo: [], sendPhoto: [], sendDocument: [], copyMessage: [], forwardMessage: [], sendMessage: [], editMessageCaption: [] };
   const telegram = {
     sendVideo: async (...args) => { calls.sendVideo.push(args); return { message_id: 1, video: { file_id: 'seeded_id' } }; },
+    sendPhoto: async (...args) => { calls.sendPhoto.push(args); return { message_id: 11, photo: [{ file_id: 'photo_seeded_id' }] }; },
+    sendDocument: async (...args) => { calls.sendDocument.push(args); return { message_id: 12, document: { file_id: 'doc_seeded_id' } }; },
     copyMessage: async (...args) => { calls.copyMessage.push(args); return { message_id: 2, video: { file_id: 'copy_seeded_id' } }; },
     forwardMessage: async (...args) => { calls.forwardMessage.push(args); return { message_id: 3, video: { file_id: 'forward_seeded_id' } }; },
     sendMessage: async (...args) => { calls.sendMessage.push(args); return { message_id: 4 }; },
@@ -102,6 +105,7 @@ test('delivery: hot path sendVideo called with cached file_id when bot_file_ids[
     _id: 'R1',
     caption_number: 7,
     source: { channel_id: APPROVED_CHANNEL, message_id: 11 },
+    metadata: { kind: 'video' },
     bot_file_ids: { [BOT_KEY_FIXTURE]: VIDEO_FILE_ID },
   };
   const restoreChannelCache = patchModule('src/cache', {
@@ -123,19 +127,102 @@ test('delivery: hot path sendVideo called with cached file_id when bot_file_ids[
   });
   const { deliverVideoForQuery, BOT_KEY } = requireFresh('src/services/delivery');
   assert.equal(BOT_KEY, BOT_KEY_FIXTURE);
-  const result = await deliverVideoForQuery(telegram, USER_CHAT, '7');
+  const result = await deliverVideoForQuery(telegram, USER_CHAT, '7', USER_MSG_ID);
   restoreChannelCache();
   restoreRateLimit();
   restoreVideo();
   restoreUA();
   assert.equal(result.delivered, true, 'delivered=true via hot path');
-  assert.equal(result.via, 'hot_sendVideo');
+  assert.equal(result.via, 'hot_send_video');
   assert.equal(calls.sendVideo.length, 1, 'exactly one sendVideo call');
   assert.deepEqual(calls.sendVideo[0].slice(0, 2), [USER_CHAT, VIDEO_FILE_ID]);
   const extra = calls.sendVideo[0][2] || {};
   assert.equal(extra.supports_streaming, true);
+  assert.equal(extra.reply_to_message_id, USER_MSG_ID, 'hot sendVideo replies to the user query message');
+  assert.equal(calls.sendPhoto.length, 0, 'sendPhoto NOT called on hot video path');
+  assert.equal(calls.sendDocument.length, 0, 'sendDocument NOT called on hot video path');
   assert.equal(calls.copyMessage.length, 0, 'copyMessage NOT called on hot path');
   assert.equal(calls.forwardMessage.length, 0, 'forwardMessage NOT called on hot path');
+});
+
+test('delivery: hot sendPhoto for metadata.kind=photo', async () => {
+  freshEnv();
+  const { telegram, calls } = fakeTelegramSpies();
+  const PHOTO_FID = 'PHOTO_FID_A';
+  const row = {
+    _id: 'Rp', caption_number: 77,
+    source: { channel_id: APPROVED_CHANNEL, message_id: 99 },
+    metadata: { kind: 'photo' },
+    bot_file_ids: { [BOT_KEY_FIXTURE]: PHOTO_FID },
+  };
+  const restoreChannelCache = patchModule('src/cache', {
+    channelCache: { countApproved: () => 1, isApproved: (id) => id === APPROVED_CHANNEL },
+  });
+  const restoreRateLimit = patchModule('src/queue/rateLimit', {
+    rateLimited: async (fn) => await fn(),
+    queryCache: { get: () => undefined, set: () => {} },
+  });
+  const restoreVideo = patchModule('src/models/Video', {
+    findOne: () => ({ lean: async () => row }),
+    findOneAndUpdate: () => ({ lean: async () => null }),
+  });
+  const restoreUA = patchModule('src/models/UserbotAccount', {
+    findOne: () => ({ select: () => ({ limit: () => ({ lean: async () => null }) }) }),
+  });
+  const { deliverVideoForQuery } = requireFresh('src/services/delivery');
+  const result = await deliverVideoForQuery(telegram, USER_CHAT, '77', USER_MSG_ID);
+  restoreChannelCache();
+  restoreRateLimit();
+  restoreVideo();
+  restoreUA();
+  assert.equal(result.delivered, true);
+  assert.equal(result.via, 'hot_send_photo');
+  assert.equal(calls.sendPhoto.length, 1);
+  assert.equal(calls.sendPhoto[0][0], USER_CHAT);
+  assert.equal(calls.sendPhoto[0][1], PHOTO_FID);
+  assert.equal(calls.sendPhoto[0][2]?.reply_to_message_id, USER_MSG_ID);
+  assert.equal(calls.sendVideo.length, 0);
+  assert.equal(calls.sendDocument.length, 0);
+});
+
+test('delivery: hot sendDocument for metadata.kind=document', async () => {
+  freshEnv();
+  const { telegram, calls } = fakeTelegramSpies();
+  const DOC_FID = 'DOC_FID_X';
+  const row = {
+    _id: 'Rd', caption_number: 777,
+    source: { channel_id: APPROVED_CHANNEL, message_id: 100 },
+    metadata: { kind: 'document' },
+    bot_file_ids: { [BOT_KEY_FIXTURE]: DOC_FID },
+  };
+  const restoreChannelCache = patchModule('src/cache', {
+    channelCache: { countApproved: () => 1, isApproved: (id) => id === APPROVED_CHANNEL },
+  });
+  const restoreRateLimit = patchModule('src/queue/rateLimit', {
+    rateLimited: async (fn) => await fn(),
+    queryCache: { get: () => undefined, set: () => {} },
+  });
+  const restoreVideo = patchModule('src/models/Video', {
+    findOne: () => ({ lean: async () => row }),
+    findOneAndUpdate: () => ({ lean: async () => null }),
+  });
+  const restoreUA = patchModule('src/models/UserbotAccount', {
+    findOne: () => ({ select: () => ({ limit: () => ({ lean: async () => null }) }) }),
+  });
+  const { deliverVideoForQuery } = requireFresh('src/services/delivery');
+  const result = await deliverVideoForQuery(telegram, USER_CHAT, '777', USER_MSG_ID);
+  restoreChannelCache();
+  restoreRateLimit();
+  restoreVideo();
+  restoreUA();
+  assert.equal(result.delivered, true);
+  assert.equal(result.via, 'hot_send_document');
+  assert.equal(calls.sendDocument.length, 1);
+  assert.equal(calls.sendDocument[0][0], USER_CHAT);
+  assert.equal(calls.sendDocument[0][1], DOC_FID);
+  assert.equal(calls.sendDocument[0][2]?.reply_to_message_id, USER_MSG_ID);
+  assert.equal(calls.sendVideo.length, 0);
+  assert.equal(calls.sendPhoto.length, 0);
 });
 
 test('delivery: cold copyMessage (then forward fallback) on missing hot file_id, and seeds file_id back', async () => {
@@ -166,7 +253,7 @@ test('delivery: cold copyMessage (then forward fallback) on missing hot file_id,
     findOne: () => ({ select: () => ({ limit: () => ({ lean: async () => null }) }) }),
   });
   const { deliverVideoForQuery } = requireFresh('src/services/delivery');
-  const result = await deliverVideoForQuery(telegram, USER_CHAT, '8');
+  const result = await deliverVideoForQuery(telegram, USER_CHAT, '8', USER_MSG_ID);
   restoreChannelCache();
   restoreRateLimit();
   restoreVideo();
@@ -175,6 +262,8 @@ test('delivery: cold copyMessage (then forward fallback) on missing hot file_id,
   assert.equal(result.via, 'cold_copy_forward');
   assert.equal(calls.copyMessage.length, 1);
   assert.deepEqual(calls.copyMessage[0].slice(0, 3), [USER_CHAT, APPROVED_CHANNEL, 22]);
+  assert.equal(calls.copyMessage[0][3]?.reply_to_message_id, USER_MSG_ID, 'copyMessage includes reply_to_message_id');
+  assert.equal(calls.copyMessage[0][3]?.disable_notification, true);
   assert.equal(calls.forwardMessage.length, 0);
   assert.ok(lastUpdate && lastUpdate.set && lastUpdate.set.$set, 'findOneAndUpdate should be called to seed file_id');
   const seeded = lastUpdate.set.$set[`bot_file_ids.${BOT_KEY_FIXTURE}`];
@@ -206,14 +295,16 @@ test('delivery: copy fails, falls back to forwardMessage', async () => {
     findOne: () => ({ select: () => ({ limit: () => ({ lean: async () => null }) }) }),
   });
   const { deliverVideoForQuery } = requireFresh('src/services/delivery');
-  const result = await deliverVideoForQuery(telegram, USER_CHAT, '9');
+  const result = await deliverVideoForQuery(telegram, USER_CHAT, '9', USER_MSG_ID);
   restoreChannelCache();
   restoreRateLimit();
   restoreVideo();
   restoreUA();
   assert.equal(result.delivered, true);
   assert.equal(calls.copyMessage.length, 1, 'copy attempted');
+  assert.equal(calls.copyMessage[0][3]?.reply_to_message_id, USER_MSG_ID, 'copy attempt also passes reply_to_message_id');
   assert.equal(calls.forwardMessage.length, 1, 'forward fallback triggered');
+  assert.equal(calls.forwardMessage[0][3]?.reply_to_message_id, USER_MSG_ID, 'forward fallback also passes reply_to_message_id');
 });
 
 test('delivery: silent gate: no approved channels returns no_approved_channels_silent', async () => {
@@ -318,7 +409,7 @@ test('captions: replyCaptionInChannel calls telegram.sendMessage with reply_to_m
   // handleCaptionCollision only replies now (no edits): verify exact text.
   await handleCaptionCollision(telegram, APPROVED_CHANNEL, 999, 1, 555);
   const lastMsg = calls.sendMessage[calls.sendMessage.length - 1];
-  assert.equal(lastMsg[1], 'Number already exists❌\nVideo number changed to 555✅');
+  assert.equal(lastMsg[1], 'Number already exists❌\nMedia number changed to 555✅');
   assert.equal(lastMsg[2].reply_to_message_id, 999);
   restoreRateLimit();
   restoreCounter();

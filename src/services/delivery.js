@@ -56,7 +56,7 @@ async function hasActiveUserbot() {
   }
 }
 
-async function hotSendVideo(telegram, chatId, row) {
+async function hotSendMedia(telegram, chatId, row, replyToMessageId) {
   try {
     const botKey = BOT_KEY;
     const fid = row && row.bot_file_ids ? row.bot_file_ids[botKey] : null;
@@ -64,10 +64,22 @@ async function hotSendVideo(telegram, chatId, row) {
 
     return await rateLimited(async () => {
       try {
-        const msg = await telegram.sendVideo(chatId, fid, { supports_streaming: true });
-        return { ok: true, via: 'hot_sendVideo', message: msg };
+        const kind = row && row.metadata && typeof row.metadata.kind === 'string' ? row.metadata.kind.toLowerCase() : 'video';
+        const baseExtra = {};
+        if (replyToMessageId) baseExtra.reply_to_message_id = replyToMessageId;
+        let msg = null;
+        if (kind === 'photo') {
+          msg = await telegram.sendPhoto(chatId, fid, baseExtra);
+        } else if (kind === 'document') {
+          const extra = { disable_content_type_detection: false, ...baseExtra };
+          msg = await telegram.sendDocument(chatId, fid, extra);
+        } else {
+          const extra = { supports_streaming: true, ...baseExtra };
+          msg = await telegram.sendVideo(chatId, fid, extra);
+        }
+        return { ok: true, via: `hot_send_${kind}`, message: msg };
       } catch (err) {
-        return { ok: false, reason: 'sendVideo_failed', error: err };
+        return { ok: false, reason: 'hot_send_failed', error: err };
       }
     });
   } catch (err) {
@@ -75,7 +87,7 @@ async function hotSendVideo(telegram, chatId, row) {
   }
 }
 
-async function coldForwardAndSeed(telegram, chatId, row) {
+async function coldForwardAndSeed(telegram, chatId, row, replyToMessageId) {
   try {
     if (!row || !row.source || !row.source.channel_id || !row.source.message_id) {
       return { ok: false, reason: 'missing_source' };
@@ -83,18 +95,15 @@ async function coldForwardAndSeed(telegram, chatId, row) {
     if (!channelCache.isApproved(String(row.source.channel_id))) {
       return { ok: false, reason: 'channel_unapproved' };
     }
+    const extra = replyToMessageId ? { reply_to_message_id: replyToMessageId, disable_notification: true } : { disable_notification: true };
 
     const msg = await rateLimited(async () => {
       try {
-        return await telegram.copyMessage(chatId, row.source.channel_id, row.source.message_id, {
-          disable_notification: true,
-        });
+        return await telegram.copyMessage(chatId, row.source.channel_id, row.source.message_id, extra);
       } catch (forwardErr) {
         // fall back to forwardMessage if copy fails
         try {
-          return await telegram.forwardMessage(chatId, row.source.channel_id, row.source.message_id, {
-            disable_notification: true,
-          });
+          return await telegram.forwardMessage(chatId, row.source.channel_id, row.source.message_id, extra);
         } catch (err) {
           return null;
         }
@@ -142,7 +151,7 @@ async function userbotDirectFallback(row, chatId) {
   }
 }
 
-async function deliverVideoForQuery(bot, chatId, userText) {
+async function deliverVideoForQuery(bot, chatId, userText, replyToMessageId) {
   try {
     if (!userText) return { delivered: false, reason: 'no_input' };
     const n = parseCaptionNumber(userText);
@@ -161,10 +170,10 @@ async function deliverVideoForQuery(bot, chatId, userText) {
       return { delivered: false, reason: 'video_channel_unapproved_silent' };
     }
 
-    let res = await hotSendVideo(bot, chatId, row);
+    let res = await hotSendMedia(bot, chatId, row, replyToMessageId);
     if (res && res.ok) return { delivered: true, via: res.via };
 
-    res = await coldForwardAndSeed(bot, chatId, row);
+    res = await coldForwardAndSeed(bot, chatId, row, replyToMessageId);
     if (res && res.ok) return { delivered: true, via: res.via };
 
     res = await userbotDirectFallback(row, chatId);
@@ -180,7 +189,7 @@ async function deliverVideoForQuery(bot, chatId, userText) {
 module.exports = {
   BOT_KEY,
   findVideoByCaption,
-  hotSendVideo,
+  hotSendMedia,
   coldForwardAndSeed,
   userbotDirectFallback,
   deliverVideoForQuery,

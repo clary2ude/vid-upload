@@ -394,11 +394,20 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
     if (msg.chat && (msg.chat.type === 'channel' || msg.chat.type === 'supergroup')) {
       await upsertChannelFromChat(msg.chat, ctx.from?.id || null);
     }
-    const video =
+
+    // Accept any media type we can deliver: video, document (any file), photo.
+    const media =
       msg.video ||
-      (msg.document && /^video\//i.test(msg.document.mime_type || '') ? msg.document : null) ||
+      (msg.document ? msg.document : null) ||
+      (msg.photo && Array.isArray(msg.photo) && msg.photo.length > 0
+        ? msg.photo[msg.photo.length - 1]
+        : null) ||
       null;
-    if (!video && !msg.photo) return next();
+    if (!media) return next();
+    let mediaKind = 'document';
+    if (msg.video) mediaKind = 'video';
+    else if (msg.photo && msg.photo.length > 0) mediaKind = 'photo';
+    else if (msg.document) mediaKind = 'document';
 
     const chatId = msg.chat && msg.chat.id != null ? String(msg.chat.id) : null;
     const messageId = msg.message_id;
@@ -434,10 +443,11 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
     });
 
     // Check if row already exists by (channel, message_id) or file_unique_id
+    const fileUniqueId = media?.file_unique_id || null;
     const existing = await Video.findOne({
       $or: [
         { 'source.channel_id': chatId, 'source.message_id': Number(messageId) },
-        video?.file_unique_id ? { file_unique_id: video.file_unique_id } : { _id: null },
+        fileUniqueId ? { file_unique_id: fileUniqueId } : { _id: null },
       ],
     })
       .lean()
@@ -453,7 +463,8 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
           patch.caption_number = manualN;
         } else {
           patch.caption_number = Number(caption);
-          if (approved && chatId && messageId) {
+          // Always reply the notice to the admin on collision, regardless of approval status.
+          if (chatId && messageId) {
             try {
               await handleCaptionCollision(ctx.telegram, chatId, Number(messageId), manualN, Number(caption));
               ranCollisionChain = true;
@@ -466,7 +477,7 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
         if (Number(existing.caption_number) !== Number(caption)) {
           patch.caption_number = Number(caption);
         }
-        if (approved && chatId && messageId) {
+        if (chatId && messageId) {
           try {
             await handleCaptionCollision(ctx.telegram, chatId, Number(messageId), manualN, Number(caption));
             ranCollisionChain = true;
@@ -476,7 +487,7 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
         }
       }
 
-      if (!existing.file_unique_id && video?.file_unique_id) patch.file_unique_id = video.file_unique_id;
+      if (!existing.file_unique_id && fileUniqueId) patch.file_unique_id = fileUniqueId;
       patch.last_seen_at = new Date();
       if (Object.keys(patch).length) {
         try { await Video.updateOne({ _id: existing._id }, { $set: patch }); } catch (err) { console.error('[ingest] update error:', err.message); }
@@ -484,19 +495,19 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
       return next();
     }
 
-    const botSlot = { [BOT_KEY]: video?.file_id || null };
+    const botSlot = { [BOT_KEY]: media?.file_id || null };
     const row = {
       caption_number: caption,
       source: { channel_id: chatId, message_id: Number(messageId) },
       metadata: {
-        kind: video ? 'video' : 'photo',
-        mime_type: video?.mime_type || '',
-        file_name: video?.file_name || '',
-        file_size: Number(video?.file_size || 0),
+        kind: mediaKind,
+        mime_type: media?.mime_type || '',
+        file_name: media?.file_name || '',
+        file_size: Number(media?.file_size || 0),
         uploaded_at: msg.date ? new Date(msg.date * 1000) : new Date(),
       },
-      bot_file_ids: video?.file_id ? botSlot : {},
-      file_unique_id: video?.file_unique_id || null,
+      bot_file_ids: media?.file_id ? botSlot : {},
+      file_unique_id: fileUniqueId,
       mtproto: null,
       last_seen_at: new Date(),
     };
@@ -514,7 +525,8 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
       return next();
     }
 
-    if (manualCollision && approved && chatId && messageId) {
+    // Always reply collision notice (unapproved channels too — admin needs to see what happened).
+    if (manualCollision && chatId && messageId) {
       try {
         await handleCaptionCollision(ctx.telegram, chatId, Number(messageId), manualN, Number(caption));
       } catch (err) {
@@ -548,10 +560,11 @@ bot.on('text', async (ctx, next) => {
         const chatId = ctx.chat?.id;
         const chatType = ctx.chat?.type;
         const isPrivate = chatType === 'private';
+        const userMsgId = ctx.message?.message_id || ctx.callbackQuery?.message?.message_id || null;
         if (chatId) {
-          const res = await deliverVideoForQuery(ctx.telegram, chatId, txt);
+          const res = await deliverVideoForQuery(ctx.telegram, chatId, txt, userMsgId || undefined);
           // Silence explicitly on: no_approved_channels_silent, video_channel_unapproved_silent, bad_input
-          // not_found -> reply in private chats with "No video with that number❌"
+          // not_found -> reply in private chats with "No media with that number❌"
           const SILENT = new Set([
             'no_approved_channels_silent',
             'video_channel_unapproved_silent',
@@ -559,8 +572,12 @@ bot.on('text', async (ctx, next) => {
           ]);
           if (res.delivered) return;
           if (res.reason && SILENT.has(res.reason)) return;
-          if (isPrivate && res.reason === 'not_found') {
-            try { await ctx.reply('No video with that number❌'); } catch (err) { console.error('[text not_found reply error]:', err.message); }
+          if (isPrivate && res.reason === 'not_found' && userMsgId) {
+            try {
+              await ctx.reply('No media with that number❌', { reply_to_message_id: userMsgId });
+            } catch (err) {
+              console.error('[text not_found reply error]:', err.message);
+            }
             return;
           }
         }
