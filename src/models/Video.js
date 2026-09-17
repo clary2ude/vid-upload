@@ -18,7 +18,7 @@ const videoSchema = new mongoose.Schema(
       ),
       default: null,
     },
-    file_unique_id: { type: String, default: null, sparse: true, unique: true },
+    file_unique_id: { type: String, default: undefined },
     source: {
       type: new mongoose.Schema(
         {
@@ -32,7 +32,7 @@ const videoSchema = new mongoose.Schema(
     metadata: {
       type: new mongoose.Schema(
         {
-          kind: { type: String, enum: ['video', 'photo'], default: 'video' },
+          kind: { type: String, enum: ['video', 'photo', 'document'], default: 'video' },
           mime_type: { type: String, default: '' },
           file_name: { type: String, default: '' },
           file_size: { type: Number, default: 0 },
@@ -48,6 +48,7 @@ const videoSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+videoSchema.index({ file_unique_id: 1 }, { unique: true, sparse: true });
 videoSchema.index({ 'mtproto.id': 1 }, { unique: true, sparse: true });
 videoSchema.index({ 'source.channel_id': 1, 'source.message_id': 1 }, { unique: true });
 videoSchema.index({ 'metadata.uploaded_at': -1 });

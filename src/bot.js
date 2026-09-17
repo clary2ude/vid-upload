@@ -507,10 +507,9 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
         uploaded_at: msg.date ? new Date(msg.date * 1000) : new Date(),
       },
       bot_file_ids: media?.file_id ? botSlot : {},
-      file_unique_id: fileUniqueId,
-      mtproto: null,
       last_seen_at: new Date(),
     };
+    if (fileUniqueId) row.file_unique_id = fileUniqueId;
 
     try {
       await Video.create(row);
