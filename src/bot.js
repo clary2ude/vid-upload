@@ -31,7 +31,7 @@ const {
   normalizeChannelId,
   isDeliveryEligible,
 } = require('./services/channels');
-const { allocateCaption, replyCaptionInChannel, parseCaptionNumber, classifyCaption, handleCaptionCollision } = require('./services/captions');
+const { allocateCaption, replyCaptionInChannel, replyInvalidCaptionChanged, parseCaptionNumber, classifyCaption, handleCaptionCollision } = require('./services/captions');
 const { deliverVideoForQuery, findVideoByCaption, BOT_KEY } = require('./services/delivery');
 const UserbotAccount = require('./models/UserbotAccount');
 const {
@@ -618,7 +618,11 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
         if (captionChanged) patch.caption_number = Number(caption);
         if (chatId && messageId) {
           try {
-            await replyCaptionInChannel(ctx.telegram, chatId, Number(messageId), Number(caption));
+            if (manual.kind === 'missing') {
+              await replyCaptionInChannel(ctx.telegram, chatId, Number(messageId), Number(caption));
+            } else {
+              await replyInvalidCaptionChanged(ctx.telegram, chatId, Number(messageId), Number(caption));
+            }
             ranNotice = true;
           } catch (err) {
             console.error('[ingest] existing-row bad-caption reply error:', err.message);
@@ -671,12 +675,15 @@ bot.on(['channel_post', 'edited_channel_post'], async (ctx, next) => {
         console.error('[ingest] new-row collision chain error:', err.message);
       }
     } else if (needAutoAssignReply && chatId && messageId) {
-      // Missing caption OR invalid/negative/bad_len manual caption → reply the auto-assigned number.
-      // Approved gate NOT removed: on unapproved channels this was causing bot-reply-to-message permission
-      // noise; admins can still see the auto-assigned number via DB row.
+      // Missing caption OR invalid/negative/bad_len manual caption → reply.
+      // Approved gate kept: on unapproved channels bot often can't reply to message ids it didn't post from.
       try {
         if (approved) {
-          await replyCaptionInChannel(ctx.telegram, chatId, Number(messageId), Number(caption));
+          if (manual.kind === 'missing') {
+            await replyCaptionInChannel(ctx.telegram, chatId, Number(messageId), Number(caption));
+          } else {
+            await replyInvalidCaptionChanged(ctx.telegram, chatId, Number(messageId), Number(caption));
+          }
         }
       } catch (err) {
         console.error('[ingest] bad/missing caption reply error:', err.message);

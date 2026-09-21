@@ -8,6 +8,7 @@ const Admin = require('./models/Admin');
 const UploadChannel = require('./models/UploadChannel');
 const { adminCache, channelCache } = require('./cache');
 const { seedSuperAdminFromEnv } = require('./seed');
+const { startPruneLoop, stopPruneLoop } = require('./services/pruneStale');
 
 const PORT = Number(process.env.PORT || process.env.port || 3000);
 const SELF_URL = (process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
@@ -90,6 +91,13 @@ async function boot() {
     bot = require('./bot');
 
     try {
+      startPruneLoop();
+      console.log('[boot] Prune stale loop scheduled (20 min, session-gated).');
+    } catch (err) {
+      console.error('[boot] prune loop start failed:', err?.message || err);
+    }
+
+    try {
       const me = await bot.telegram.getMe();
       console.log(`[boot] Bot getMe ok: @${me.username || 'n/a'} (${me.id})`);
     } catch (err) {
@@ -117,8 +125,8 @@ async function boot() {
       console.warn('[boot] setMyCommands failed:', err?.message || err);
     }
 
-    process.once('SIGINT', () => { try { if (bot) bot.stop('SIGINT'); } catch {} process.exit(0); });
-    process.once('SIGTERM', () => { try { if (bot) bot.stop('SIGTERM'); } catch {} process.exit(0); });
+    process.once('SIGINT', () => { try { stopPruneLoop(); } catch {} try { if (bot) bot.stop('SIGINT'); } catch {} process.exit(0); });
+    process.once('SIGTERM', () => { try { stopPruneLoop(); } catch {} try { if (bot) bot.stop('SIGTERM'); } catch {} process.exit(0); });
 
     bot.launch().catch((err) => {
       if (err && err.message !== 'Aborted') console.error('[bot.launch]', err?.stack || err?.message || err);

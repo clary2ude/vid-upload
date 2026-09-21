@@ -87,6 +87,36 @@ async function hotSendMedia(telegram, chatId, row, replyToMessageId) {
   }
 }
 
+function copyForwardErrorLooksLikeDeadMessage(err) {
+  if (!err) return false;
+  const d = String(err?.description || err?.message || '').toLowerCase();
+  if (!d) return false;
+  return (
+    d.includes('to copy not found') ||
+    d.includes('message to forward not found') ||
+    d.includes('message_id_invalid') ||
+    d.includes('message not found') ||
+    d.includes('channel_private') ||
+    (d.includes('bad request') && (d.includes('message') && d.includes('not found')))
+  );
+}
+
+async function lazyDeleteIfDead(row, err) {
+  if (!row || !row._id) return false;
+  if (!copyForwardErrorLooksLikeDeadMessage(err)) return false;
+  try {
+    await Video.deleteOne({ _id: row._id });
+    try {
+      queryCache.delete(`vid:${Number(row.caption_number)}`);
+      pendingPromiseCache.delete(`vid:${Number(row.caption_number)}`);
+    } catch {}
+    return true;
+  } catch (dbErr) {
+    console.error('[delivery] lazy delete error:', dbErr.message);
+    return false;
+  }
+}
+
 async function coldForwardAndSeed(telegram, chatId, row, replyToMessageId) {
   try {
     if (!row || !row.source || !row.source.channel_id || !row.source.message_id) {
@@ -97,20 +127,27 @@ async function coldForwardAndSeed(telegram, chatId, row, replyToMessageId) {
     }
     const extra = replyToMessageId ? { reply_to_message_id: replyToMessageId, disable_notification: true } : { disable_notification: true };
 
+    let lastError = null;
     const msg = await rateLimited(async () => {
       try {
         return await telegram.copyMessage(chatId, row.source.channel_id, row.source.message_id, extra);
       } catch (forwardErr) {
-        // fall back to forwardMessage if copy fails
+        lastError = forwardErr;
         try {
           return await telegram.forwardMessage(chatId, row.source.channel_id, row.source.message_id, extra);
         } catch (err) {
+          lastError = err;
           return null;
         }
       }
     });
 
-    if (!msg) return { ok: false, reason: 'copy_or_forward_failed' };
+    if (!msg) {
+      if (lastError) {
+        try { await lazyDeleteIfDead(row, lastError); } catch {}
+      }
+      return { ok: false, reason: 'copy_or_forward_failed', error: lastError };
+    }
 
     const extracted = msg && msg.video ? msg.video.file_id : null;
     if (extracted) {

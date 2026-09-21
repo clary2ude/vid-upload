@@ -91,8 +91,9 @@ async function replyCaptionInChannel(telegram, channelChatId, replyToMessageId, 
   try {
     await rateLimited(async () => {
       try {
-        return await telegram.sendMessage(channelChatId, String(captionNumber), {
+        return await telegram.sendMessage(channelChatId, `<b>${String(captionNumber)}</b>`, {
           reply_to_message_id: replyToMessageId,
+          parse_mode: 'HTML',
           disable_web_page_preview: true,
           disable_notification: true,
         });
@@ -104,6 +105,30 @@ async function replyCaptionInChannel(telegram, channelChatId, replyToMessageId, 
     });
   } catch (err) {
     console.error('[captions] rate limited reply error:', err.message);
+  }
+}
+
+async function replyInvalidCaptionChanged(telegram, channelChatId, replyToMessageId, newCaption) {
+  try {
+    await rateLimited(async () => {
+      try {
+        return await telegram.sendMessage(
+          channelChatId,
+          `Invalid number❌\nChanged to <b>${String(newCaption)}</b>`,
+          {
+            reply_to_message_id: replyToMessageId,
+            parse_mode: 'HTML',
+            disable_web_page_preview: true,
+            disable_notification: true,
+          }
+        );
+      } catch (err) {
+        console.error('[captions] invalid-caption reply error:', err.message);
+        return null;
+      }
+    });
+  } catch (err) {
+    console.error('[captions] invalid-caption rate wrap error:', err.message);
   }
 }
 
@@ -145,6 +170,7 @@ module.exports = {
   getNextAutoCaption,
   allocateCaption,
   replyCaptionInChannel,
+  replyInvalidCaptionChanged,
   replyCollisionNotice,
   handleCaptionCollision,
 };

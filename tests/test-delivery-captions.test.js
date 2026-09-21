@@ -397,15 +397,25 @@ test('captions: replyCaptionInChannel calls telegram.sendMessage with reply_to_m
   const restoreVideo = patchModule('src/models/Video', { findOne: () => ({ select: () => ({ lean: async () => null }) }) });
   const restoreCounter = patchModule('src/models/Counter', {});
   const restoreRateLimit = patchModule('src/queue/rateLimit', { rateLimited: async (fn) => await fn(), queryCache: { get: () => undefined, set: () => {} } });
-  const { replyCaptionInChannel, handleCaptionCollision } = requireFresh('src/services/captions');
+  const { replyCaptionInChannel, replyInvalidCaptionChanged, handleCaptionCollision } = requireFresh('src/services/captions');
   await replyCaptionInChannel(telegram, APPROVED_CHANNEL, 1234, 5678);
   assert.equal(calls.sendMessage.length, 1);
   const [chatId, text, extra] = calls.sendMessage[0];
   assert.equal(chatId, APPROVED_CHANNEL);
-  assert.equal(text, '5678');
+  assert.equal(text, '<b>5678</b>');
+  assert.equal(extra.parse_mode, 'HTML');
   assert.equal(extra.reply_to_message_id, 1234);
   assert.equal(extra.disable_web_page_preview, true);
   assert.equal(extra.disable_notification, true);
+  await replyInvalidCaptionChanged(telegram, APPROVED_CHANNEL, 4000, 77);
+  assert.equal(calls.sendMessage.length, 2);
+  const invalidMsg = calls.sendMessage[1];
+  assert.equal(invalidMsg[0], APPROVED_CHANNEL);
+  assert.equal(invalidMsg[1], 'Invalid number❌\nChanged to <b>77</b>');
+  assert.equal(invalidMsg[2].parse_mode, 'HTML');
+  assert.equal(invalidMsg[2].reply_to_message_id, 4000);
+  assert.equal(invalidMsg[2].disable_web_page_preview, true);
+  assert.equal(invalidMsg[2].disable_notification, true);
   // handleCaptionCollision only replies now (no edits): verify exact text.
   await handleCaptionCollision(telegram, APPROVED_CHANNEL, 999, 1, 555);
   const lastMsg = calls.sendMessage[calls.sendMessage.length - 1];
@@ -459,4 +469,122 @@ test('captions: allocateCaption auto-generates for bad manual inputs (invalid/ne
   restoreCounter();
   restoreVideo();
   restoreCache();
+});
+
+test('delivery: cold copyMessage dead-message error triggers lazy Video.deleteOne', async () => {
+  freshEnv();
+  const { telegram, calls } = fakeTelegramSpies();
+  telegram.copyMessage = async () => {
+    calls.copyMessage.push([]);
+    const e = new Error('Bad Request: message to copy not found');
+    e.code = 400;
+    e.description = 'Bad Request: message to copy not found';
+    throw e;
+  };
+  telegram.forwardMessage = async () => {
+    calls.forwardMessage.push([]);
+    const e = new Error('Bad Request: message to forward not found');
+    e.code = 400;
+    e.description = 'Bad Request: message to forward not found';
+    throw e;
+  };
+
+  const row = {
+    _id: 'DEADROW', caption_number: 99,
+    source: { channel_id: APPROVED_CHANNEL, message_id: 501 },
+    bot_file_ids: {},
+  };
+  let deletedOneCalled = null;
+  const restoreChannelCache = patchModule('src/cache', {
+    channelCache: { countApproved: () => 1, isApproved: (id) => id === APPROVED_CHANNEL },
+  });
+  const restoreRateLimit = patchModule('src/queue/rateLimit', {
+    rateLimited: async (fn) => await fn(),
+    queryCache: { get: () => undefined, set: () => {}, delete: () => {} },
+  });
+  const restoreVideo = patchModule('src/models/Video', {
+    findOne: () => ({ lean: async () => row }),
+    findOneAndUpdate: () => ({ lean: async () => null }),
+    deleteOne: async (q) => { deletedOneCalled = q; return { ok: true, deletedCount: 1 }; },
+  });
+  const restoreUA = patchModule('src/models/UserbotAccount', {
+    findOne: () => ({ select: () => ({ limit: () => ({ lean: async () => null }) }) }),
+  });
+  const { deliverVideoForQuery } = requireFresh('src/services/delivery');
+  const result = await deliverVideoForQuery(telegram, USER_CHAT, '99', USER_MSG_ID);
+  restoreChannelCache();
+  restoreRateLimit();
+  restoreVideo();
+  restoreUA();
+  assert.equal(result.delivered, false);
+  assert.equal(result.reason, 'all_paths_exhausted');
+  assert.equal(calls.copyMessage.length, 1);
+  assert.equal(calls.forwardMessage.length, 1);
+  assert.deepEqual(deletedOneCalled, { _id: 'DEADROW' });
+});
+
+test('delivery: cold copyMessage generic 500 error does NOT lazy-delete', async () => {
+  freshEnv();
+  const { telegram, calls } = fakeTelegramSpies();
+  telegram.copyMessage = async () => {
+    calls.copyMessage.push([]);
+    const e = new Error('500 Internal Server Error');
+    e.code = 500;
+    e.description = 'Internal Server Error';
+    throw e;
+  };
+  telegram.forwardMessage = async () => {
+    calls.forwardMessage.push([]);
+    const e = new Error('500 Internal Server Error');
+    e.code = 500;
+    e.description = 'Internal Server Error';
+    throw e;
+  };
+  const row = {
+    _id: 'KEEPME', caption_number: 999,
+    source: { channel_id: APPROVED_CHANNEL, message_id: 600 },
+    bot_file_ids: {},
+  };
+  let deleteOneCalled = null;
+  const restoreChannelCache = patchModule('src/cache', {
+    channelCache: { countApproved: () => 1, isApproved: (id) => id === APPROVED_CHANNEL },
+  });
+  const restoreRateLimit = patchModule('src/queue/rateLimit', {
+    rateLimited: async (fn) => await fn(),
+    queryCache: { get: () => undefined, set: () => {} },
+  });
+  const restoreVideo = patchModule('src/models/Video', {
+    findOne: () => ({ lean: async () => row }),
+    findOneAndUpdate: () => ({ lean: async () => null }),
+    deleteOne: async (q) => { deleteOneCalled = q; return { deletedCount: 1 }; },
+  });
+  const restoreUA = patchModule('src/models/UserbotAccount', {
+    findOne: () => ({ select: () => ({ limit: () => ({ lean: async () => null }) }) }),
+  });
+  const { deliverVideoForQuery } = requireFresh('src/services/delivery');
+  const res = await deliverVideoForQuery(telegram, USER_CHAT, '999', USER_MSG_ID);
+  restoreChannelCache();
+  restoreRateLimit();
+  restoreVideo();
+  restoreUA();
+  assert.equal(res.reason, 'all_paths_exhausted');
+  assert.equal(calls.copyMessage.length, 1);
+  assert.equal(deleteOneCalled, null);
+});
+
+test('pruneStale: runPrunePass with no userbot session silently skips deletes', async () => {
+  freshEnv();
+  const deleteManyCalls = [];
+  const restoreUA = patchModule('src/models/UserbotAccount', {
+    findOne: () => ({ select: () => ({ lean: async () => null }) }),
+  });
+  const restoreVideo = patchModule('src/models/Video', {
+    find: () => ({ sort: () => ({ limit: () => ({ select: () => ({ lean: async () => [] }) }) }) }),
+    deleteMany: async (q) => { deleteManyCalls.push(q); return { deletedCount: 0 }; },
+  });
+  const prune = requireFresh('src/services/pruneStale');
+  await prune.runPrunePass();
+  restoreUA();
+  restoreVideo();
+  assert.deepEqual(deleteManyCalls, []);
 });
