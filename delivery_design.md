@@ -15,6 +15,21 @@ query(n)  ->  hot_send_* (cached per-bot file_id)
            ->  userbot_direct (Plan 4/5 GramJS MTProto fallback, session-gated)
 ```
 
+Userbots (GramJS / StringSession) are involved in **more than just the delivery fallback**.
+Every role that touches MTProto-native identifiers or channel message deletion goes
+through a userbot session (if one is saved in the DB; otherwise silent no-op):
+
+| userbot role                                         | when it runs                              | module + ref                                                                 | userbot channel right required |
+|------------------------------------------------------|-------------------------------------------|------------------------------------------------------------------------------|--------------------------------|
+| **Plan 4 delivery fallback**                         | hot + cold both fail                      | [delivery.js:174-189](file:///c:/Users/Itive%20Peace%20Ufuoma/Desktop/TG%20BOTS/Client%20Pbox/src/services/delivery.js#L174-L189) | plain member/subscriber        |
+| **Plan 5 file_reference refresh** (reserved hook)    | Plan 4 hits FILE_REFERENCE_* error        | same `userbotDirectFallback` stub slot above                                 | plain member/subscriber        |
+| **Periodic prune sweep** (dead message probe)        | every 20 min after boot                   | [pruneStale.js](file:///c:/Users/Itive%20Peace%20Ufuoma/Desktop/TG%20BOTS/Client%20Pbox/src/services/pruneStale.js) | plain member/subscriber        |
+| **Clear Storage** (channel post deletion)            | admin clicks `🧹 Clear Storage` → Yes     | `clear_storage_yes` worker in [bot.js](file:///c:/Users/Itive%20Peace%20Ufuoma/Desktop/TG%20BOTS/Client%20Pbox/src/bot.js) | admin + `delete_messages` on each target channel |
+| **Ingest** (media MTProto id capture, future)        | channel_post ingest (reserved on row)     | Video row `mtproto.{id,access_hash,file_reference}` slot in [Video.js](file:///c:/Users/Itive%20Peace%20Ufuoma/Desktop/TG%20BOTS/Client%20Pbox/src/models/Video.js) | plain member (observer-only)   |
+
+The single invariant across every userbot role above: **no saved `UserbotAccount.session`
+→ silent skip, console log only, never any UI-visible error or message to users.**
+
 Source code lives in [delivery.js](file:///c:/Users/Itive%20Peace%20Ufuoma/Desktop/TG%20BOTS/Client%20Pbox/src/services/delivery.js).
 Supporting modules:
 
@@ -105,7 +120,7 @@ Cold path additionally gates on `channelCache.isApproved(source.channel_id)` —
 a channel from the approved list (UI `❌` toggle) silently kills delivery even if a hot
 file_id is still cached.
 
-### 2.3 Tier 3 — GramJS MTProto direct delivery (Plan 4/5)
+### 2.3 Tier 3 — GramJS MTProto direct delivery (Plan 4) + file_reference refresh (Plan 5)
 
 `userbotDirectFallback` in [delivery.js:174-189](file:///c:/Users/Itive%20Peace%20Ufuoma/Desktop/TG%20BOTS/Client%20Pbox/src/services/delivery.js#L174-L189)
 is intentionally decoupled from the bot token:
@@ -116,15 +131,50 @@ if (!ok) return { ok: false, reason: 'no_userbot_session' };
 return { ok: false, reason: 'userbot_engine_stub' };
 ```
 
-The userbot path uses `InputMediaDocument / InputPhoto (id, access_hash, file_reference)`
-under GramJS, which are **observer-portable**: a userbot subscriber of the source channel
-can materialise any media in that channel by `(id, access_hash)` regardless of which bot
-the file was ingested through. Plan 4 delivers directly to the user chat; Plan 5 is
-reserved for a refresh of `file_reference` when it ages out (handled silently, no UI
-error ever visible to end users per requirements).
+**Common preconditions for both Plan 4 and Plan 5:**
+- There exists at least one row in `UserbotAccount` whose `session` field is non-null.
+  Sessions are captured via the **Uploader → Add Account** login flow in
+  [uploaderLogin.js](file:///c:/Users/Itive%20Peace%20Ufuoma/Desktop/TG%20BOTS/Client%20Pbox/src/bot/uploaderLogin.js),
+  which runs a GramJS phone → auth code → 2FA password state machine and persists the
+  resulting `StringSession` back to the `UserbotAccount` model.
+- The logged-in userbot account is a **plain member/subscriber of the source upload channel**.
+  Admin bit / `post_messages` right are **NOT** required for Plan 4/5. If the userbot is
+  not in the channel, `channels.getMessages` and peer resolution fail with
+  `CHANNEL_PRIVATE`/`USER_NOT_PARTICIPANT` → errors are logged to console only; the
+  delivery step silently returns up the stack.
 
-The stub `userbot_engine_stub` preserves the pipeline shape; a real GramJS worker can be
-spliced in without touching the hot/cold layers above.
+**Plan 4 — direct media delivery.**
+The delivery engine (currently a stub) uses MTProto `InputMediaDocument / InputPhoto
+(id, access_hash, file_reference)` to send the media **directly to the end-user chat**
+from the userbot account. These identifiers are observer-portable:
+
+- `id` is the numeric media id on the source channel post.
+- `access_hash` is the associated hash pair (observer-specific per-user-per-media but
+  readable by any subscriber via `channels.getMessages` on the post).
+- `file_reference` is a short-lived Telegram token that must be refreshed periodically
+  (see Plan 5 below).
+
+Plan 4 is **fully independent of bot tokens and bot file_id scoping**, which is why it
+sits after cold_copy_forward as the final fallback: when hot (bot-scoped file_id) and cold
+(copyMessage via bot API member admin rights) both fail, Plan 4 can still deliver as long
+as the userbot can observe the source channel.
+
+**Plan 5 — file_reference refresh (and re-seed via userbot).**
+`file_reference` bytes expire after a few hours. The Plan 5 hook, when splice-wired inside
+the same `userbotDirectFallback` slot, will:
+
+1. Detect `FILE_REFERENCE_*` / `FILE_REFERENCE_EXPIRED` from Plan 4's send.
+2. Re-read the same `(source.channel_id, source.message_id)` via userbot
+   `channels.getMessages([InputMessageID])`.
+3. Extract the returned message's fresh `media.document.file_reference` / `media.photo.file_reference`.
+4. Upsert it into the Video row's `mtproto.file_reference` and re-attempt Plan 4.
+
+Like Plan 4, Plan 5 only needs subscriber membership of the source channel. It does NOT
+need `post_messages` or admin bit.
+
+The current stub `userbot_engine_stub` preserves the pipeline shape; a real GramJS worker
+can be spliced in without touching the hot/cold layers above and without modifying any
+call site in `deliverVideoForQuery`.
 
 ---
 
@@ -193,6 +243,11 @@ for (const m of res.messages) if (!String(m.className).endsWith('Empty')) alive.
 // rows whose id is missing from alive -> Video.deleteMany({ _id: { $in: deadRowIds } })
 ```
 
+**Userbot right requirements for the prune sweep:** the logged-in userbot only needs to be
+a **plain subscriber / member** of each source channel. `channels.getMessages` is an
+observer-only method; admin bit and `post_messages` / `delete_messages` rights are **not**
+required for prune to succeed. This is the exact same precondition as Plan 4/5 delivery.
+
 No userbot session in DB → early return, zero console/UI noise. All errors during the
 pass (peer resolution, channel probe, DB delete) are swallowed with `console.error`
 only per the silent-failure UI rule.
@@ -209,6 +264,15 @@ only per the silent-failure UI rule.
 3. Paginate all Video rows, group per `(source.channel_id, [message_id...])`.
 4. Per chunk → `client.invoke(new api.channels.DeleteMessages({ channel: peer, id: InputMessageID[] }))`.
 5. UI always replies with exactly `Storage cleared.` + main menu, regardless of errors.
+
+**Userbot right requirements for Clear Storage:** because Clear Storage uses the
+userbot to call `channels.DeleteMessages` on the source channel, the logged-in userbot
+account must hold **admin rights with `delete_messages` enabled on that specific channel**
+(or be the channel creator). Unlike Plan 4/5 delivery and the prune sweep — which only
+need plain subscriber membership — deletion is a write operation. For any channel where
+the userbot lacks that admin bit, the delete invocation errors out with a console.log-only
+message; the UI still replies `Storage cleared.` per the no-UI-error rule, and other
+channels continue being processed.
 
 **Important distinction vs stale cleanup:**
 - Clear Storage deletes **actual channel posts** via userbot; Video rows are kept.
@@ -232,10 +296,21 @@ as follows:
    new slot, cached row is refreshed. Same caption queried again later → straight to hot.
 3. **Tier 3 (userbot) — 100 % unaffected.** The GramJS StringSession is tied to a user
    account, not a bot token. Previously saved sessions continue to work.
+   **Key bypass:** if you forget to add the NEW bot to one of the source upload channels,
+   Tier 2 (cold copyMessage) fails with `forbidden` / `channel_private`, but Plan 4
+   (userbot direct) *still delivers* as long as the userbot is a subscriber of that
+   channel. This is the userbot fallback's most important role during bot migrations —
+   it masks missing bot membership for legacy channels. The new bot's cold path will
+   still never reseed until you add it to the channel, so users keep getting served
+   via userbot direct until that admin step is done.
 4. **Newly ingested media.** Ingest listener sees files directly on the NEW bot's
    `msg.video/document/photo[]` → writes `bot_file_ids[NEW_BOT_KEY]` immediately.
    Hot path works from day zero for new uploads.
 5. **Clear Storage + pruneStale.** Both use GramJS sessions, unaffected by the swap.
+   Even if the new bot is NOT added to the channel yet, the periodic prune sweep and
+   the Clear Storage delete worker continue to probe and delete via the userbot session
+   (plain subscriber for prune, admin+delete_messages for Clear Storage). The new bot's
+   rights are completely independent.
 6. **Stale rows.** Lazy detector fires as before if any old row's source message was
    deleted between the swap and the first user query.
 
